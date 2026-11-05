@@ -1,7 +1,8 @@
 """
-SCS Datastar Platformer Backend - BGS-MP-SYNC Python Implementation
-Normative spec: https://github.com/EricEisaman/babylon-game-starter/blob/main/MULTIPLAYER_SYNCH.md
-Short name: SCS-MP-SYNC
+SCS Datastar Backend with MP-SYNC Python Implementation
+Normative mp spec: https://github.com/EricEisaman/babylon-game-starter/blob/main/MULTIPLAYER_SYNCH.md
+Normative match-making spec: TBD
+Short name: SCS-MATCH
 Transport: HTTPS + SSE (Datastar)
 Encoding: JSON UTF-8
 
