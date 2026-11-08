@@ -1,40 +1,5 @@
-"""
-SCS Datastar Backend with MP-SYNC Python Implementation — v2.
+"""SCS-MATCH: HTTPS + SSE. One join shape serves every game."""
 
-Normative mp spec: https://github.com/EricEisaman/babylon-game-starter/blob/main/MULTIPLAYER_SYNCH.md
-Normative match-making spec: this file + multiplayer/protocol.py (v2).
-
-Short name: SCS-MATCH
-Transport: HTTPS + SSE (Datastar)
-Encoding: JSON UTF-8
-
-Implements (legacy, unchanged behaviour):
-- Session lifecycle: join, leave, stream (SSE)
-- State messages: character-state, item-state, item-authority-claim/release
-- Authority: itemOwners + envArrivalOrder + envAuthority (per §4.7, §4.8)
-- Signals: character-state-update, item-state-update, client-joined, client-left,
-  synchronizer-changed, item-authority-changed, env-item-authority-changed
-- Dirty filter + freshness matrix (simplified for platformer)
-
-Implements (v2, new):
-- Configurable sessions: ``GameSessionConfig`` on join — requires_matchmaking,
-  requires_turn_based, max/minPlayersPerRoom, authority scopes, matchmaking
-  + turn tuning, opaque custom_rules. See protocol.py.
-- Match-making: skill-aware queue (``Matchmaker``). Skill is resolved through
-  a ``SkillProvider`` — client-reported today, DB tomorrow (one-line swap in
-  ``get_skill_provider``). Queue widens its skill tolerance with wait time.
-- Rooms: match-made players land in a room; direct (non-matchmade) joins land
-  in a room keyed by environment_name, exactly as before. Broadcasts are
-  room-scoped for match-made / turn-based rooms, environment-scoped for legacy.
-- Turn-based state: generic ``TurnManager`` (whose turn, deadlines, pass /
-  resign, terminal detection). Game rules live in ``TurnValidator``s.
-  generic turn machinery + ````. The reference example
-  for adding any future turn-based game.
-
-Deliberately NOT in this change (see reply for discussion):
-persistence / DB skill provider, reconnect-resume, spectators, bots,
-ranked ladders, anti-cheat, parties, ELO updates after a match.
-"""
 
 from __future__ import annotations
 
@@ -58,7 +23,7 @@ from .api.chat_proxy import router as chat_proxy_router
 from .settings import settings
 from .multiplayer.protocol import (
     AuthorityConfig, Capabilities, CharacterState,
-    ClientReportedSkillProvider, DatabaseSkillProvider, GameSessionConfig,
+    ClientReportedSkillProvider, GameSessionConfig,
     JoinRequest, JoinResponse,
     MatchmakingConfig, SkillProvider, SkillRating,
     TurnAction, TurnActionResponse, TurnConfig, TurnState,
@@ -74,31 +39,11 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# ---------------------------------------------------------------------------
-# Skill provider wiring — THE one place to swap client -> DB authority.
-# ---------------------------------------------------------------------------
-
 def get_skill_provider() -> SkillProvider:
-    """Today: trust what the client sends on join.
-
-    Tomorrow: ``return DatabaseSkillProvider(db)`` — nothing else changes:
-    ``Matchmaker`` and the routes only ever see a ``SkillRating``.
-    """
     return ClientReportedSkillProvider()
-    # return DatabaseSkillProvider(db)  # <- future swap
 
-
-# ---------------------------------------------------------------------------
-# Turn-based state management (generic — no game rules in here)
-# ---------------------------------------------------------------------------
 
 class TurnManager:
-    """Enforces turn order, deadlines, pass/resign, terminal state.
-
-    Game rules are delegated to a ``TurnValidator``. The manager owns only:
-    whose turn it is, when the turn expires, and whether the game is over.
-    """
-
     def __init__(self, room_id: str, player_ids: List[str],
                  config: GameSessionConfig,
                  validator: Optional[Any] = None):
@@ -108,22 +53,13 @@ class TurnManager:
         order = list(player_ids)
         if config.turn.turn_order_strategy == "random":
             random.shuffle(order)
-        # "skill_order" is applied by the caller (it has the ratings);
-        # anything else keeps join order.
-        # No validator == client-authoritative game: initial state is
-        # empty until the first mover sends proposed_state. The server
-        # never invents game state.
         initial = validator.initial_state(order, config) if validator else {}
         self.state = TurnState(
             room_id=room_id, game_id=config.game_id, phase="in_progress" if order else "waiting",
             current_player_id=order[0] if order else None, turn_number=1,
-            turn_order=order,
-            turn_deadline_ms=(_now_ms() + config.turn.turn_timeout_ms)
-            if config.turn.turn_timeout_ms else None,
-            state=initial,
+            turn_order=order, state=initial,
         )
 
-    # -- actions ------------------------------------------------------
     def apply_action(self, client_id: str, action: TurnAction) -> TurnActionResponse:
         st = self.state
         if st.phase != "in_progress":
@@ -140,7 +76,6 @@ class TurnManager:
             return TurnActionResponse(ok=True, accepted=True, reason="ok", turn_state=st)
         if st.current_player_id != client_id:
             return TurnActionResponse(ok=True, accepted=False, reason="not_your_turn", turn_state=st)
-        # --- Branch A: server-validated game (validator registered) ---
         if self.validator is not None:
             accepted, reason, new_state = self.validator.validate(st.state, client_id, action, self.config)
             if not accepted or new_state is None:
@@ -156,12 +91,6 @@ class TurnManager:
             else:
                 self._advance()
             return TurnActionResponse(ok=True, accepted=True, reason="ok", turn_state=st)
-        # --- Branch B: client-authoritative (default, 1000s of games) ---
-        # Server enforces turn/phase only. It does NOT interpret payload.
-        # The mover's proposed_state becomes canonical; claimed terminal
-        # results are accepted at face value and broadcast. Clients that
-        # disagree can detect divergence from the action stream (all
-        # moves are broadcast, so the full history is auditable).
         if action.proposed_state is not None:
             if not isinstance(action.proposed_state, dict):
                 return TurnActionResponse(ok=True, accepted=False, reason="invalid_proposed_state", turn_state=st)
@@ -177,30 +106,13 @@ class TurnManager:
             self._advance()
         return TurnActionResponse(ok=True, accepted=True, reason="ok", turn_state=st)
 
-    def check_timeout(self, now_ms: int) -> Optional[TurnActionResponse]:
-        """Called from the tick loop. Returns a response if a deadline fired."""
-        st = self.state
-        if st.phase != "in_progress" or not st.turn_deadline_ms or now_ms < st.turn_deadline_ms:
-            return None
-        current = st.current_player_id or ""
-        if self.config.turn.timeout_action == "forfeit":
-            self._finish(winner_id=self._other_player(current), end_reason="timeout")
-        elif self.config.turn.timeout_action == "pass":
-            self._advance(reason="timeout")
-        else:  # "none" — just extend the deadline, never auto-act
-            st.turn_deadline_ms = now_ms + (self.config.turn.turn_timeout_ms or 30_000)
-            return None
-        return TurnActionResponse(ok=True, accepted=True, reason="timeout", turn_state=st)
-
     def on_player_left(self, client_id: str) -> Optional[TurnActionResponse]:
-        """A leaver forfeits the game (if it was in progress)."""
         if self.state.phase != "in_progress":
             return None
         self._finish(winner_id=self._other_player(client_id), end_reason="opponent_left")
         return TurnActionResponse(ok=True, accepted=True, reason="opponent_left",
                                   turn_state=self.state)
 
-    # -- internals ----------------------------------------------------
     def _advance(self, reason: str = "move") -> None:
         st = self.state
         if not st.turn_order:
@@ -208,8 +120,6 @@ class TurnManager:
         idx = st.turn_order.index(st.current_player_id) if st.current_player_id in st.turn_order else -1
         st.current_player_id = st.turn_order[(idx + 1) % len(st.turn_order)]
         st.turn_number += 1
-        st.turn_deadline_ms = (_now_ms() + self.config.turn.turn_timeout_ms) \
-            if self.config.turn.turn_timeout_ms else None
         st.timestamp = _now_ms()
 
     def _finish(self, winner_id: Optional[str], is_draw: bool = False,
@@ -220,7 +130,6 @@ class TurnManager:
         st.is_draw = is_draw
         st.end_reason = end_reason
         st.current_player_id = None
-        st.turn_deadline_ms = None
         st.timestamp = _now_ms()
 
     def _other_player(self, client_id: str) -> Optional[str]:
@@ -257,7 +166,7 @@ class Matchmaker:
 
     async def enqueue(self, client_id: str, session_id: str,
                       req: JoinRequest, skill: SkillRating) -> QueuedPlayer:
-        config = req.config or GameSessionConfig.from_legacy(req.game_id)
+        config = req.config or GameSessionConfig.default(req.game_id)
         qp = QueuedPlayer(client_id=client_id, session_id=session_id,
                           game_id=req.game_id, config=config, skill=skill,
                           fingerprint=config.fingerprint())
@@ -282,21 +191,13 @@ class Matchmaker:
         return None
 
     def try_form_matches(self, fingerprint: str) -> List[List[QueuedPlayer]]:
-        """Greedy best-fit: oldest waiter first, pair/group with the
-        closest-skill waiters inside the (wait-widened) tolerance.
-        Returns full groups ready to become rooms."""
         waiters = self.queues.get(fingerprint, [])
         if not waiters:
             return []
         config = waiters[0].config
-        need = config.max_players_per_room  # rooms fill to max; min is a floor for starting
-        # A room may start early once min is reached AND everyone in it is
-        # within tolerance — the caller decides "start now vs keep waiting".
-        # Here: only form when we can fill to max, or min is met and the
-        # oldest waiter has waited past half of max_wait.
+        need = config.max_players_per_room
         now = _now_ms()
         formed: List[List[QueuedPlayer]] = []
-        # Work on a copy, oldest first.
         pool = sorted(waiters, key=lambda q: q.enqueued_at_ms)
         while len(pool) >= config.min_players_per_room:
             oldest = pool[0]
@@ -305,32 +206,16 @@ class Matchmaker:
                           if abs(q.skill.rating - oldest.skill.rating) <= tolerance]
             candidates.sort(key=lambda q: abs(q.skill.rating - oldest.skill.rating))
             group = [oldest] + candidates[: need - 1]
-            can_fill = len(group) >= need
-            waited_long = (now - oldest.enqueued_at_ms) >= config.matchmaking.max_wait_ms // 2
-            if not (can_fill or (len(group) >= config.min_players_per_room and waited_long)):
-                break  # oldest cannot match yet — nobody newer will beat them
+            if len(group) < config.min_players_per_room:
+                break
             for q in group:
                 pool.remove(q)
             formed.append(group)
-        # Persist the remainder.
         if pool:
             self.queues[fingerprint] = pool
         else:
             self.queues.pop(fingerprint, None)
         return formed
-
-    def timed_out(self, fingerprint: str, now_ms: int) -> List[QueuedPlayer]:
-        """Waiters past max_wait — caller signals timeout and drops them."""
-        waiters = self.queues.get(fingerprint, [])
-        if not waiters:
-            return []
-        config = waiters[0].config
-        expired = [q for q in waiters if now_ms - q.enqueued_at_ms >= config.matchmaking.max_wait_ms]
-        if expired:
-            self.queues[fingerprint] = [q for q in waiters if q not in expired]
-            if not self.queues[fingerprint]:
-                self.queues.pop(fingerprint, None)
-        return expired
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +229,6 @@ class ClientSession:
     environment: str
     character_name: str
     is_synchronizer: bool
-    # v2
     game_id: str = "default"
     player_id: str = ""
     room_id: Optional[str] = None
@@ -363,7 +247,8 @@ class Room:
     game_id: str
     config: GameSessionConfig
     player_ids: List[str] = field(default_factory=list)
-    status: str = "waiting"  # waiting | in_progress | finished
+    status: str = "waiting"
+    custom: Dict[str, Any] = field(default_factory=dict)
     turn_manager: Optional[TurnManager] = None
     created_at_ms: int = field(default_factory=_now_ms)
 
@@ -373,7 +258,6 @@ class Room:
 
 
 class MultiplayerRegistry:
-    # Validators by game_id — register a new turn-based game here, one line.
     VALIDATORS: Dict[str, Any] = {}
 
     def __init__(self, skill_provider: Optional[SkillProvider] = None):
@@ -382,78 +266,34 @@ class MultiplayerRegistry:
         self.authority = AuthorityManager()
         self.dirty_filter = DirtyFilter()
         self.freshness = FreshnessMatrix()
-        self.base_synchronizer: Optional[str] = None
+        self.synchronizers: Dict[str, str] = {}
         self.character_cache: Dict[str, CharacterState] = {}
         self.item_cache: Dict[str, Dict[str, Any]] = {}
         self.item_environments: Dict[str, str] = {}
-        # v2
         self.skill_provider = skill_provider or get_skill_provider()
         self.matchmaker = Matchmaker(self.skill_provider)
         self.rooms: Dict[str, Room] = {}
         self._lock = asyncio.Lock()
-        self._tick_task: Optional[asyncio.Task] = None
         self.running = True
 
     async def start(self):
-        self._tick_task = asyncio.create_task(self._tick_loop())
         print("[SCS-MP-SYNC] Registry started")
 
     async def stop(self):
         self.running = False
-        if self._tick_task:
-            self._tick_task.cancel()
-            try:
-                await self._tick_task
-            except asyncio.CancelledError:
-                pass
         print("[SCS-MP-SYNC] Registry stopped")
-
-    async def _tick_loop(self):
-        while self.running:
-            await asyncio.sleep(1 / 20)  # 20Hz tick
-            async with self._lock:
-                # Turn deadlines.
-                for room in list(self.rooms.values()):
-                    if room.turn_manager:
-                        fired = room.turn_manager.check_timeout(_now_ms())
-                        if fired:
-                            await self._broadcast_to_room(
-                                room.room_id, "turn-state-update",
-                                {"turnState": room.turn_manager.state.to_dict(),
-                                 "timestamp": _now_ms()})
-                            if room.turn_manager.state.phase == "finished":
-                                room.status = "finished"
-                                await self._broadcast_to_room(
-                                    room.room_id, "game-over",
-                                    {"roomId": room.room_id, "winnerId": room.turn_manager.state.winner_id,
-                                     "isDraw": room.turn_manager.state.is_draw,
-                                     "endReason": room.turn_manager.state.end_reason,
-                                     "turnState": room.turn_manager.state.to_dict(),
-                                     "timestamp": _now_ms()})
-                # Match-making timeouts.
-                for fingerprint in list(self.matchmaker.queues.keys()):
-                    for qp in self.matchmaker.timed_out(fingerprint, _now_ms()):
-                        session = self.clients.get(qp.client_id)
-                        if session:
-                            session.match_status = "timeout"
-                            await self._send_to_client(
-                                qp.client_id, "matchmaking-timeout",
-                                {"eventType": "matchmaking_timeout", "clientId": qp.client_id,
-                                 "gameId": qp.game_id, "reason": "no_match_within_max_wait",
-                                 "timestamp": _now_ms()})
 
     # -- join ----------------------------------------------------------
     async def join(self, req: JoinRequest) -> JoinResponse:
         req.normalize()
-        config = req.config or GameSessionConfig.from_legacy(req.game_id)
+        config = req.config or GameSessionConfig.default(req.game_id)
         async with self._lock:
             client_id = uuid.uuid4().hex[:8]
             session_id = uuid.uuid4().hex[:16]
-            # Skill: resolved through the provider (client today, DB tomorrow).
             skill = await self.skill_provider.resolve_skill(
                 player_id=req.player_id or client_id, game_id=req.game_id,
                 client_reported=req.skill)
-            is_sync = self.base_synchronizer is None
+            is_sync = req.environment_name not in self.synchronizers
             session = ClientSession(
                 client_id=client_id, session_id=session_id,
                 environment=req.environment_name, character_name=req.character_name,
@@ -462,8 +302,7 @@ class MultiplayerRegistry:
             self.clients[client_id] = session
             self.sessions[session_id] = client_id
             if is_sync:
-                self.base_synchronizer = client_id
-
+                self.synchronizers[req.environment_name] = client_id
             if config.requires_matchmaking:
                 session.match_status = "queued"
                 await self.matchmaker.enqueue(client_id, session_id, req, skill)
@@ -473,11 +312,15 @@ class MultiplayerRegistry:
                                             "gameId": req.game_id, "queuePosition": pos,
                                             "timestamp": _now_ms()})
                 await self._try_fill_queues(config.fingerprint())
+                after = self.clients.get(client_id)
+                status = after.match_status if after else "queued"
+                room_id = after.room_id if after else None
                 return JoinResponse(client_id=client_id, session_id=session_id,
                                     is_synchronizer=is_sync, existing_clients=0,
-                                    game_id=req.game_id, match_status="queued",
-                                    queue_position=pos, skill_source=skill.source, config=config)
-            # Direct join — legacy path, now room-backed.
+                                    room_id=room_id, game_id=req.game_id, match_status=status,
+                                    queue_position=pos if status == "queued" else None,
+                                    seat=after.seat if after else None,
+                                    skill_source=skill.source, config=config)
             room = self._get_or_create_direct_room(req, config)
             seat = len(room.player_ids)
             room.player_ids.append(client_id)
@@ -513,9 +356,9 @@ class MultiplayerRegistry:
             await self._on_room_changed(room)
 
     def _get_or_create_direct_room(self, req: JoinRequest, config: GameSessionConfig) -> Room:
-        """Legacy: one room per environment. Explicit room_id / room_code
+        """Direct: one room per environment. Explicit room_id / room_code
         lets friend / private rooms share a key instead."""
-        key = req.room_id or req.room_code or f"legacy:{req.environment_name or config.game_id}"
+        key = req.room_id or req.room_code or f"direct:{req.environment_name or config.game_id}"
         for room in self.rooms.values():
             if room.room_id == key or getattr(room, "_join_key", None) == key:
                 return room
@@ -532,9 +375,7 @@ class MultiplayerRegistry:
         if len(room.player_ids) < room.config.min_players_per_room:
             room.status = "waiting"
             return
-        # Room is playable. For turn-based rooms, start the turn manager
-        # once the room is full (or min is met and no more are expected —
-        # direct rooms start at min; match-made rooms always arrive full).
+        # Room is playable.
         if room.config.requires_turn_based and room.turn_manager is None:
             validator = self.VALIDATORS.get(room.game_id)
             order = list(room.player_ids)
@@ -558,7 +399,7 @@ class MultiplayerRegistry:
                                           "playerIds": list(room.player_ids),
                                           "timestamp": _now_ms()})
 
-    # -- match-making helpers used by routes ---------------------------
+    # -- match-making helpers ---------------------------
     async def cancel_matchmaking(self, client_id: str) -> bool:
         async with self._lock:
             session = self.clients.get(client_id)
@@ -577,15 +418,19 @@ class MultiplayerRegistry:
             if session.sse_queue:
                 self._enqueue_signal(session.sse_queue, "__close__", {})
             session.sse_queue = None
-            if self.base_synchronizer == client_id:
-                if self.clients:
-                    new_sync = next(iter(self.clients))
-                    self.base_synchronizer = new_sync
+            if self.synchronizers.get(session.environment) == client_id:
+                remaining = [c for c in self.clients.values() if c.environment == session.environment]
+                if remaining:
+                    new_sync = remaining[0].client_id
+                    self.synchronizers[session.environment] = new_sync
+                    for c in remaining:
+                        c.is_synchronizer = (c.client_id == new_sync)
                     await self._broadcast_signal("synchronizer-changed",
                                                  {"newSynchronizerId": new_sync, "reason": "disconnection",
-                                                  "timestamp": _now_ms()})
+                                                  "timestamp": _now_ms()},
+                                                 environment=session.environment)
                 else:
-                    self.base_synchronizer = None
+                    self.synchronizers.pop(session.environment, None)
             events = self.authority.client_leaves(client_id)
             for ev in events:
                 if ev["type"] == "env-authority-changed":
@@ -625,8 +470,7 @@ class MultiplayerRegistry:
         return self.clients.get(client_id)
 
     async def switch_environment(self, client_id: str, environment: str):
-        # Legacy behaviour preserved verbatim (see git history); rooms are
-        # not moved by this call — use leave + join with a new config.
+        # Rooms stay where they are.
         async with self._lock:
             client = self.clients.get(client_id)
             if not client:
@@ -674,10 +518,97 @@ class MultiplayerRegistry:
                     self._enqueue_signal(client.sse_queue, signal_name, payload)
             return environment
 
-    # -- SSE plumbing ---------------------------------------------------
+    # -- SSE plumbing: one mp signal per client ---
+    def _mp_patch_for(self, signal_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        mp: Dict[str, Any] = {"timestamp": payload.get("timestamp", _now_ms())}
+        if signal_name == "matchmaking-queued":
+            mp["match"] = {"status": "queued", "queuePosition": payload.get("queuePosition"),
+                           "gameId": payload.get("gameId")}
+        elif signal_name == "match-found":
+            mp["match"] = {"status": "matched", "roomId": payload.get("roomId"),
+                           "gameId": payload.get("gameId"), "playerIds": payload.get("playerIds"),
+                           "seat": payload.get("seat"), "turnOrder": payload.get("turnOrder")}
+            mp["room"] = {"roomId": payload.get("roomId"), "gameId": payload.get("gameId"),
+                          "playerIds": payload.get("playerIds")}
+        elif signal_name == "turn-state-update":
+            mp["turnState"] = payload.get("turnState")
+        elif signal_name == "game-over":
+            mp["turnState"] = payload.get("turnState")
+            mp["match"] = {"status": "finished", "roomId": payload.get("roomId")}
+        elif signal_name == "room-ready":
+            mp["room"] = {"roomId": payload.get("roomId"), "gameId": payload.get("gameId"),
+                          "playerIds": payload.get("playerIds"), "turnOrder": payload.get("turnOrder")}
+        elif signal_name == "character-state-update":
+            mp["characters"] = payload.get("updates")
+        elif signal_name == "item-state-update":
+            mp["items"] = {"updates": payload.get("updates"), "collections": payload.get("collections")}
+        elif signal_name == "client-joined":
+            mp["clientJoined"] = payload
+        elif signal_name == "client-left":
+            mp["clientLeft"] = payload
+        elif signal_name == "synchronizer-changed":
+            mp["synchronizer"] = payload
+        elif signal_name == "item-authority-changed":
+            mp["itemAuthority"] = payload
+        elif signal_name == "env-item-authority-changed":
+            mp["envAuthority"] = payload
+        elif signal_name == "effects-state-update":
+            mp["effects"] = payload
+        elif signal_name == "custom-state-update":
+            mp["custom"] = payload.get("custom")
+            mp["room"] = {"roomId": payload.get("roomId")}
+        else:
+            mp[signal_name] = payload
+        return mp
+
+    def _mp_for_client(self, client: ClientSession) -> Dict[str, Any]:
+        now = _now_ms()
+        env_name = client.environment
+        room = self.rooms.get(client.room_id) if client.room_id else None
+        mp: Dict[str, Any] = {
+            "timestamp": now,
+            "connection": {"clientId": client.client_id, "sessionId": client.session_id,
+                           "isSynchronizer": client.is_synchronizer, "environment": env_name,
+                           "roomId": client.room_id, "gameId": client.game_id,
+                           "matchStatus": client.match_status},
+            "clients": [{"clientId": c.client_id, "character": c.character_name,
+                         "environment": c.environment}
+                        for c in self.clients.values() if c.environment == env_name],
+            "characters": [st.to_dict() for oid, st in self.character_cache.items()
+                           if oid in self.clients and self.clients[oid].environment == env_name],
+            "items": {"updates": [row for row in self.item_cache.values()
+                                  if self._item_belongs_to_environment(row.get("instanceId", ""), env_name)],
+                      "collections": []},
+        }
+        if room:
+            mp["room"] = {"roomId": room.room_id, "gameId": room.game_id,
+                          "playerIds": list(room.player_ids)}
+            mp["custom"] = dict(room.custom)
+            if room.turn_manager:
+                mp["turnState"] = room.turn_manager.state.to_dict()
+        if client.match_status == "queued":
+            mp["match"] = {"status": "queued",
+                           "queuePosition": self.matchmaker.queue_position(client.client_id),
+                           "gameId": client.game_id, "roomId": client.room_id}
+        elif room:
+            mp["match"] = {"status": "matched", "roomId": room.room_id, "gameId": room.game_id,
+                           "playerIds": list(room.player_ids), "seat": client.seat}
+        else:
+            mp["match"] = {"status": client.match_status, "roomId": client.room_id,
+                           "gameId": client.game_id}
+        return mp
+
     @staticmethod
     def _enqueue_signal(queue: asyncio.Queue, signal_name: str, payload: Dict[str, Any]):
         try:
+            if signal_name == "mp" and payload.get("turnState") is not None:
+                for item in list(queue._queue):
+                    if item[0] == "mp" and item[1].get("turnState") is not None and "match" not in item[1]:
+                        try:
+                            queue._queue.remove(item)
+                        except ValueError:
+                            pass
+                        break
             queue.put_nowait((signal_name, payload))
         except asyncio.QueueFull:
             try:
@@ -689,10 +620,12 @@ class MultiplayerRegistry:
     async def _send_to_client(self, client_id: str, signal_name: str, payload: Dict[str, Any]):
         client = self.clients.get(client_id)
         if client and client.sse_queue:
-            self._enqueue_signal(client.sse_queue, signal_name, payload)
+            if signal_name in ("__close__", "__resync__"):
+                self._enqueue_signal(client.sse_queue, signal_name, payload)
+            else:
+                self._enqueue_signal(client.sse_queue, "mp", self._mp_patch_for(signal_name, payload))
 
     async def attach_stream(self, client_id: str):
-        """Atomically attach a live queue and capture the matching snapshot."""
         async with self._lock:
             client = self.clients.get(client_id)
             if not client:
@@ -701,7 +634,7 @@ class MultiplayerRegistry:
                 self._enqueue_signal(client.sse_queue, "__close__", {})
             queue = asyncio.Queue(maxsize=64)
             client.sse_queue = queue
-            bootstrap = self._bootstrap_for_client(client)
+            bootstrap = [("mp", self._mp_for_client(client))]
             return queue, bootstrap
 
     async def detach_stream(self, client_id: str, queue: asyncio.Queue):
@@ -711,44 +644,7 @@ class MultiplayerRegistry:
                 client.sse_queue = None
 
     def _bootstrap_for_client(self, client: ClientSession):
-        env_name = client.environment
-        now = _now_ms()
-        bootstrap = [("connectionState",
-                      {"connectionState": "connected", "clientId": client.client_id,
-                       "sessionId": client.session_id, "isSynchronizer": client.is_synchronizer,
-                       "environment": env_name, "roomId": client.room_id, "gameId": client.game_id,
-                       "matchStatus": client.match_status,
-                       "serverTick": 0, "datastarConnected": True})]
-        for existing in self.clients.values():
-            if existing.environment == env_name and existing.client_id != client.client_id:
-                bootstrap.append(("client-joined",
-                                  {"eventType": "joined", "clientId": existing.client_id,
-                                   "environment": env_name, "character": existing.character_name,
-                                   "totalClients": sum(s.environment == env_name for s in self.clients.values()),
-                                   "timestamp": now}))
-        env_authority = self.authority.envAuthority.get(env_name)
-        if env_authority:
-            bootstrap.append(("envAuthority",
-                              {"environmentName": env_name, "previousAuthorityId": None,
-                               "newAuthorityId": env_authority, "reason": "arrival", "timestamp": now}))
-        for instance_id, owner in self.authority.itemOwners.items():
-            if self._item_belongs_to_environment(instance_id, env_name):
-                bootstrap.append(("itemAuthority",
-                                  {"instanceId": instance_id, "previousOwnerId": None,
-                                   "newOwnerId": owner["ownerClientId"], "reason": "claim", "timestamp": now}))
-        characters = [state.to_dict() for owner_id, state in self.character_cache.items()
-                      if owner_id in self.clients and self.clients[owner_id].environment == env_name]
-        if characters:
-            bootstrap.append(("character-state-update", {"updates": characters, "timestamp": now}))
-        items = [row for instance_id, row in self.item_cache.items()
-                 if self._item_belongs_to_environment(instance_id, env_name)]
-        bootstrap.append(("item-state-update", {"updates": items, "collections": [], "timestamp": now}))
-        # v2: turn state for the client's room, if it has one.
-        room = self.rooms.get(client.room_id) if client.room_id else None
-        if room and room.turn_manager:
-            bootstrap.append(("turn-state-update",
-                              {"turnState": room.turn_manager.state.to_dict(), "timestamp": now}))
-        return bootstrap
+        return [("mp", self._mp_for_client(client))]
 
     def _item_belongs_to_environment(self, instance_id: str, environment: str) -> bool:
         item_environment = self.item_environments.get(str(instance_id))
@@ -765,7 +661,7 @@ class MultiplayerRegistry:
             if environment is not None and client.environment != environment:
                 continue
             if client.sse_queue:
-                self._enqueue_signal(client.sse_queue, signal_name, payload)
+                self._enqueue_signal(client.sse_queue, "mp", self._mp_patch_for(signal_name, payload))
 
     async def _broadcast_to_room(self, room_id: str, signal_name: str, payload: Dict[str, Any]):
         room = self.rooms.get(room_id)
@@ -776,12 +672,11 @@ class MultiplayerRegistry:
 
     # -- authority gating ------------------------------------------------
     def _authority_covers(self, client: ClientSession, scope: str, resource_type: str = "*") -> bool:
-        """Per-room authority: a room whose config excludes a scope gets
-        relay-only behaviour for it — never adjudication."""
-        config = client.config or GameSessionConfig.from_legacy(client.game_id)
+        """Per-room authority."""
+        config = client.config or GameSessionConfig.default(client.game_id)
         return config.authority.covers(scope, resource_type)
 
-    # -- state handlers (legacy, authority-gated) ------------------------
+    # -- state handlers ------------------------
     async def handle_character_state(self, client_id: str, updates: List[Dict]):
         async with self._lock:
             if client_id not in self.clients:
@@ -820,7 +715,7 @@ class MultiplayerRegistry:
                     continue
                 if row.get("environment") not in (None, env_name):
                     continue
-                # Authority-gated: rooms that don't cover "items" relay nothing.
+                # Authority-gated: rooms without items coverage relay nothing.
                 if not self._authority_covers(session, "items", "item"):
                     continue
                 resolved = self.authority.get_resolved_owner(iid, env_name)
@@ -890,7 +785,7 @@ class MultiplayerRegistry:
                 return {"ok": False, "accepted": False, "instanceId": iid, "reason": "client_claims_disabled"}
             if not self._item_belongs_to_environment(iid, session.environment):
                 return {"ok": False, "accepted": False, "instanceId": iid, "reason": "wrong_environment"}
-            result = self.authority.claim(iid, client_id, idle_timeout_ms=10000)
+            result = self.authority.claim(iid, client_id)
             if result["accepted"]:
                 if not result.get("already_owned"):
                     await self._broadcast_signal("item-authority-changed",
@@ -921,6 +816,21 @@ class MultiplayerRegistry:
                                             environment=session.environment)
             return {"ok": True, "released": result.get("released", False),
                     "instanceId": iid, "serverTimestamp": _now_ms()}
+
+    async def handle_custom_state(self, client_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        async with self._lock:
+            session = self.clients.get(client_id)
+            if not session:
+                raise HTTPException(403, "Unknown client")
+            if not session.room_id or session.room_id not in self.rooms:
+                raise HTTPException(404, "Client is not in a room")
+            room = self.rooms[session.room_id]
+            if isinstance(state, dict):
+                room.custom.update(state)
+            await self._broadcast_to_room(room.room_id, "custom-state-update",
+                                          {"roomId": room.room_id, "custom": dict(room.custom),
+                                           "timestamp": _now_ms()})
+            return dict(room.custom)
 
     # -- turn-based handlers (generic) -----------------------------------
     async def handle_turn_action(self, client_id: str, action: TurnAction) -> TurnActionResponse:
@@ -974,9 +884,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="SCS Multiplayer - BGS-MP-SYNC Python",
+    title="SCS Multiplayer",
     version="0.2.0",
-    description="Python implementation of Babylon Game Starter Multiplayer Sync - SCS-MP-SYNC, generalized: match-making, rooms, turn-based state.",
+    description="Match-making, rooms, turn-based state.",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -1000,7 +910,7 @@ def _parse_skill(raw: Any, *, player_id: str, game_id: str) -> Optional[SkillRat
     try:
         return SkillRating.from_client(raw, player_id=player_id, game_id=game_id)
     except ValueError:
-        return None  # bad skill payload must never fail a join
+        return None
 
 
 def _join_request_from_body(body: "JoinBody") -> JoinRequest:
@@ -1034,7 +944,7 @@ def _join_request_from_body(body: "JoinBody") -> JoinRequest:
         metadata=dict(raw.get("metadata") or {}))
 
 
-# ---------- BGS / generalized routes ----------
+# ---------- Routes ----------
 
 bgs_router = APIRouter(prefix="/api/multiplayer")
 
@@ -1042,7 +952,7 @@ bgs_router = APIRouter(prefix="/api/multiplayer")
 class JoinBody(BaseModel):
     environment_name: str = "default"
     character_name: str = "player"
-    # v2 — all optional, legacy clients send none of these.
+    # All optional.
     game_id: Optional[str] = None
     player_id: Optional[str] = None
     display_name: Optional[str] = None
@@ -1134,7 +1044,8 @@ async def stream(request: Request):
     client = await registry.get_client_by_session(sid)
     if not client:
         raise HTTPException(401, "Unknown session_id")
-    if sum(bool(s.sse_queue) for s in registry.clients.values()) >= 64:
+    same_game = [c for c in registry.clients.values() if c.game_id == client.game_id and c.sse_queue]
+    if len(same_game) >= 64:
         raise HTTPException(503, "Too many clients")
     queue, bootstrap = await registry.attach_stream(client.client_id)
 
@@ -1142,15 +1053,11 @@ async def stream(request: Request):
         try:
             for signal_name, payload in bootstrap:
                 yield SSE.patch_signals({signal_name: payload})
-                if signal_name == "character-state-update":
-                    yield SSE.patch_signals({"gameSnapshot": payload})
             while True:
                 signal_name, payload = await queue.get()
                 if signal_name == "__close__":
                     break
                 yield SSE.patch_signals({signal_name: payload})
-                if signal_name == "character-state-update":
-                    yield SSE.patch_signals({"gameSnapshot": payload})
         except asyncio.CancelledError:
             pass
         finally:
@@ -1221,11 +1128,25 @@ async def item_release(request: Request, body: ReleaseBody):
     return await registry.handle_item_release(cid, body.model_dump())
 
 
+class CustomStateBody(BaseModel):
+    state: Dict[str, Any] = {}
+    timestamp: Optional[int] = None
+
+
+@bgs_router.patch("/custom-state")
+async def custom_state(request: Request, body: CustomStateBody):
+    cid = _client_id_from(request)
+    if not cid:
+        raise HTTPException(400, "Missing X-Client-ID")
+    registry: MultiplayerRegistry = request.app.state.mp
+    return {"ok": True, "custom": await registry.handle_custom_state(cid, body.state)}
+
+
 # ---------- Generic turn-based routes ----------
 
 class TurnActionBody(BaseModel):
     action_type: str = "move"  # move | pass | resign
-    payload: Dict[str, Any] = {}  # opaque, game-specific — server never reads it
+    payload: Dict[str, Any] = {}
     # Client-authoritative games only; ignored when a validator is registered.
     proposed_state: Optional[Dict[str, Any]] = None
     claimed_winner_id: Optional[str] = None
@@ -1299,8 +1220,9 @@ async def effects_state(request: Request, body: EffectsBody):
     if not cid:
         raise HTTPException(400, "Missing X-Client-ID")
     registry: MultiplayerRegistry = request.app.state.mp
-    if registry.base_synchronizer != cid:
-        raise HTTPException(403, "Not base synchronizer")
+    _sess = registry.clients.get(cid)
+    if not _sess or registry.synchronizers.get(_sess.environment) != cid:
+        raise HTTPException(403, "Not synchronizer")
     session = registry.clients.get(cid)
     if not session:
         raise HTTPException(403, "Unknown client")
@@ -1312,27 +1234,15 @@ async def effects_state(request: Request, body: EffectsBody):
 app.include_router(bgs_router)
 
 
-# ---------- Demo client: GET /tic-tac-toe is a PAGE, not an API ----------
-# The API above is fully generic — it contains no game-specific routes,
-# types, or logic. The ONLY tic-tac-toe code in the repo is the static
-# demo client in ``demo/tic-tac-toe.html``, which plays tic-tac-toe by
-# calling only the generic endpoints (join with a turn-based config,
-# then turn/action + turn/state). Adding a 1001st game means adding a
-# 1001st demo/client file — never touching the API.
-#
-# This route serves that demo file. It holds no game logic: no board,
-# no win detection, no move validation. All of that lives in the
-# browser, in demo/tic-tac-toe.html.
+# ---------- Demo client ----------
 
 
 def _serve_demo_file(name: str):
-    """Shared helper for /tic-tac-toe and /demo/{name}. Generic: the
-    server never knows what game a demo file implements."""
+    """Shared helper for /tic-tac-toe and /demo/{name}."""
     from fastapi.responses import HTMLResponse
     safe = "".join(c for c in name if c.isalnum() or c in ("-", "_"))
     if not safe or safe != name:
         raise HTTPException(400, "Invalid demo name")
-    # Demo files live next to main.py: server/app/demo/<name>.html
     demo_file = _path.Path(__file__).parent / "demo" / f"{safe}.html"
     if not demo_file.exists():
         raise HTTPException(404, f"No demo client named '{safe}'")
@@ -1341,23 +1251,13 @@ def _serve_demo_file(name: str):
 
 @app.get("/tic-tac-toe", include_in_schema=False)
 async def tic_tac_toe_demo_page():
-    """Demo client entry point. Serves static HTML — not an API.
-
-    The page itself is the only tic-tac-toe-specific thing in the
-    system. Everything it calls is generic: POST /api/multiplayer/join,
-    POST /api/multiplayer/turn/action, GET /api/multiplayer/turn/state,
-    GET /api/multiplayer/matchmaking/status, POST /api/multiplayer/leave.
-    """
+    """Demo client entry point."""
     return _serve_demo_file("tic-tac-toe")
 
 
 @app.get("/demo/{name}", include_in_schema=False)
 async def demo_page(name: str):
-    """Generic demo loader: /demo/<name> serves demo/<name>.html.
-
-    /demo/chess would serve demo/chess.html with zero API changes.
-    Path is sanitised to block traversal.
-    """
+    """Generic demo loader."""
     return _serve_demo_file(name)
 
 
@@ -1371,13 +1271,13 @@ async def manifest():
     mp = _path.Path(__file__).parent.parent / "extension" / "manifest.json"
     if mp.exists():
         return JSONResponse(json.loads(mp.read_text()))
-    return JSONResponse({"id": "scs.bgs.platformer", "version": "0.2.0"})
+    return JSONResponse({"id": "scs.multiplayer", "version": "0.2.0"})
 
 
 @app.get("/")
 async def root():
     return {
-        "service": "SCS Multiplayer - SCS-MP-SYNC (BGS Python)",
+        "service": "SCS Multiplayer",
         "version": "0.2.0",
         "spec": "https://github.com/EricEisaman/babylon-game-starter/blob/main/MULTIPLAYER_SYNCH.md",
         "transport": "HTTPS + SSE (Datastar)",
@@ -1387,7 +1287,7 @@ async def root():
             "leave": "POST /api/multiplayer/leave X-Client-ID",
             "matchmaking_status": "GET /api/multiplayer/matchmaking/status X-Client-ID",
             "matchmaking_cancel": "POST /api/multiplayer/matchmaking/cancel X-Client-ID",
-            "stream": "GET /api/multiplayer/stream?session_id=... (signals: matchmaking-queued, match-found, turn-state-update, game-over, ...)",
+            "stream": "GET /api/multiplayer/stream?session_id=... (signal: mp)",
             "character-state": "PATCH /api/multiplayer/character-state X-Client-ID {updates, timestamp}",
             "item-state": "PATCH /api/multiplayer/item-state X-Client-ID {updates, collections, timestamp}",
             "item-claim": "PATCH /api/multiplayer/item-authority-claim X-Client-ID {instanceId, reason, timestamp}",
@@ -1397,9 +1297,6 @@ async def root():
             "tic_tac_toe_demo": "GET /tic-tac-toe -> demo client page (HTML, NOT an API)",
             "demo_generic": "GET /demo/{name} -> static demo client for any game",
         },
-        "signals": ["character-state-update", "item-state-update", "client-joined", "client-left",
-                    "synchronizer-changed", "item-authority-changed", "env-item-authority-changed",
-                    "matchmaking-queued", "match-found", "matchmaking-timeout",
-                    "turn-state-update", "room-ready", "game-over"],
+        "signals": ["mp"],
         "python_api": "extensions.multiplayer.MultiplayerClient",
     }

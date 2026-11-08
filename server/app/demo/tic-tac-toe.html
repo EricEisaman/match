@@ -7,8 +7,8 @@
 <style>
   :root { color-scheme: dark; }
   body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; background: #121214; color: #e8e8e8; }
-  .note { background: #1e2230; border: 1px solid #2f3a5a; color: #d6e0ff; padding: .75rem 1rem; border-radius: 8px; font-size: .9rem; }
-  .note code { background: #121214; color: #e8e8e8; padding: 0 .25rem; border-radius: 4px; }
+  .panel { background: #1e2230; border: 1px solid #2f3a5a; color: #d6e0ff; padding: .75rem 1rem; border-radius: 8px; font-size: .9rem; }
+  .panel code { background: #121214; color: #e8e8e8; padding: 0 .25rem; border-radius: 4px; }
   #board { display: grid; grid-template-columns: repeat(3, 96px); gap: 6px; margin: 1rem 0; }
   .cell { width: 96px; height: 96px; font-size: 2.5rem; cursor: pointer; border: 1px solid #444; border-radius: 8px; background: #1e1e22; color: #fff; }
   .cell:disabled { cursor: default; background: #17171a; color: #ddd; }
@@ -21,7 +21,7 @@
 </head>
 <body>
 <h1>Tic-Tac-Toe — demo client</h1>
-<p class="note">
+<p class="panel">
   Rules live here. The server enforces turns. State arrives on the SSE
   stream as one <code>mp</code> signal.
 </p>
@@ -70,7 +70,7 @@ async function join() {
     environment_name: "tic-tac-toe-demo",
     character_name: name,
     game_id: "tic-tac-toe-demo",
-    player_id: "demo-" + name.toLowerCase().replace(/\W+/g, "-"),
+    player_id: "demo-" + name.toLowerCase().replace(/\W+/g, "-") + "-" + Math.random().toString(36).slice(2, 6),
     display_name: name,
     skill: { rating: skill },
     config: {
