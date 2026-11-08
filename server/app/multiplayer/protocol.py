@@ -5,7 +5,7 @@ Normative: https://github.com/EricEisaman/babylon-game-starter/blob/main/MULTIPL
 Transport: HTTPS + SSE (Datastar)
 Encoding: JSON UTF-8
 
-This is the well-designed Python API that mirrors BGS patterns but for 2D platformer.
+This is the well-designed Python API that mirrors the BGS patterns and extends to match-making.
 """
 
 from dataclasses import dataclass, field, asdict
