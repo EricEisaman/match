@@ -1,56 +1,7 @@
-"""
-SCS-MP-SYNC v2 — generalized match-making + multiplayer protocol.
+"""Match-making + multiplayer protocol.
 
-Normative (legacy): https://github.com/EricEisaman/babylon-game-starter/blob/main/MULTIPLAYER_SYNCH.md
 Transport: HTTPS + SSE (Datastar)
 Encoding: JSON UTF-8
-
-What changed in v2
-------------------
-The old protocol assumed ONE kind of game: a realtime platformer where
-everyone in an `environment_name` is in the same room, the first arrival
-is the synchronizer / env authority, and only character + item state is
-synced.
-
-v2 keeps that behaviour as the *default* (so existing clients keep
-working) but makes the session configurable at connect time:
-
-  * ``GameSessionConfig`` — sent on the initial ``JoinRequest`` — declares
-    what this application needs:
-      - ``requires_matchmaking`` — queue players instead of dropping them
-        straight into a named room.
-      - ``requires_turn_based`` — the room is driven by a ``TurnManager``
-        (one player to move at a time, deadlines, pass / resign, game-over).
-      - ``max_players_per_room`` / ``min_players_per_room`` — room size.
-      - ``authority`` — *which* subsystems the server is authoritative
-        for (``items``, ``environment``, ``turns``, ``score``, ``custom:*``)
-        and which resource types that covers.
-      - ``matchmaking`` / ``turn`` — tuning for those subsystems.
-      - ``custom_rules`` — opaque, game-specific rules the core never
-        interprets. Games that need their own rules pass them here instead
-        of forking the protocol.
-
-  * Skill is client-reported *today* but resolved through a
-    ``SkillProvider``. Swap ``ClientReportedSkillProvider`` for
-    ``DatabaseSkillProvider`` (stub in this file) when the DB lands —
-    match-making code never sees where the number came from, only a
-    ``SkillRating`` + ``source``. See ``SkillProvider`` below.
-
-  * Turn-based games are *generic*: the core only enforces whose turn it
-    is, deadlines, and terminal state. Game rules live in the client
-    by default. A game that wants server-side adjudication may
-    optionally register a ``TurnValidator`` — no core changes.
-
-  * Rooms are first-class. Legacy ``environment_name`` maps to a direct
-    (non-matchmade) room, so old clients get exactly the old semantics.
-
-Backward compatibility
-----------------------
-All new fields on ``JoinRequest`` / ``JoinResponse`` / ``Capabilities``
-are optional with legacy defaults. A v1 client that sends only
-``{environment_name, character_name}`` gets:
-``requires_matchmaking=False, requires_turn_based=False,
-max_players_per_room=8, authority.scopes=["items", "environment"]``.
 """
 
 from __future__ import annotations
@@ -61,7 +12,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
 
 # ---------------------------------------------------------------------------
-# Skill — client-reported today, DB-authoritative tomorrow
+# Skill
 # ---------------------------------------------------------------------------
 
 SkillSource = Literal["client_reported", "database", "default"]
@@ -69,12 +20,12 @@ SkillSource = Literal["client_reported", "database", "default"]
 
 @dataclass
 class SkillRating:
-    """One number the match-maker can compare. Deliberately minimal.
+    """One number the match-maker can compare.
 
     ``rating`` is on whatever scale the game uses (Elo-like 0-3000 is the
     convention, but any monotonic scale works as long as every client for
     a given ``game_id`` uses the same one). ``deviation`` / ``confidence``
-    let a future DB provider express uncertainty without changing the
+    let a DB provider express uncertainty without changing the
     match-maker: a high-deviation player matches more loosely.
     """
 
@@ -101,7 +52,7 @@ class SkillRating:
         ``{"skill": 1250}`` / ``{"skill": {"rating": 1250}}`` /
         ``{"skill": {"rating": 1250, "deviation": 80}}`` are all accepted.
         Anything unparseable -> default rating, source still client_reported
-        (never crash match-making on a bad skill payload).
+        (keep match-making running on a bad skill payload).
         """
         if isinstance(payload, (int, float)) and not isinstance(payload, bool):
             out = cls(rating=float(payload), source="client_reported",
@@ -132,13 +83,12 @@ class SkillRating:
 
 class SkillProvider(Protocol):
     """The seam where skill comes from. Match-making depends on this
-    interface only — never on where the number was typed.
+    interface only.
 
-    Today: ``ClientReportedSkillProvider`` trusts ``JoinRequest.skill``.
-    Tomorrow: ``DatabaseSkillProvider`` looks the player up by
+    ``ClientReportedSkillProvider`` trusts ``JoinRequest.skill``.
+    ``DatabaseSkillProvider`` looks the player up by
     ``player_id`` + ``game_id`` and returns the DB rating, ignoring (or
-    cross-checking) the client value. Swapping providers must not touch
-    ``Matchmaker`` or any route.
+    cross-checking) the client value.
     """
 
     async def resolve_skill(
@@ -159,10 +109,9 @@ class ClientReportedSkillProvider:
 
 
 class DatabaseSkillProvider:
-    """FUTURE — DB-backed authority for skill. Not wired up yet.
+    """DB-backed authority for skill.
 
-    Intended shape (do not invent a schema here — agree it with the DB
-    owner first, see the ideation notes in the reply):
+    Intended shape:
 
         async def resolve_skill(...):
             row = await db.fetchone(
@@ -171,22 +120,18 @@ class DatabaseSkillProvider:
             if row is None: return SkillRating.default(...)
             return SkillRating(rating=row.rating, ..., source="database", ...)
 
-    Design decisions already baked in so the swap is mechanical:
+    Design decisions:
       * the provider is chosen in ONE place (``main.py: get_skill_provider``);
-      * if the DB is unreachable the provider should fall back to the
-        client-reported value and mark ``source="client_reported"`` rather
-        than failing the join — match-making degrades, it does not go down;
-      * the DB value, when present, always wins over the client value.
+      * if the DB is unreachable the provider falls back to the
+        client-reported value and marks ``source="client_reported"``;
+      * the DB value, when present, wins over the client value.
     """
 
     def __init__(self, db: Any = None):
         self._db = db
 
     async def resolve_skill(self, *, player_id, game_id, client_reported):
-        raise NotImplementedError(
-            "DatabaseSkillProvider is a stub: wire it to the real DB, then "
-            "swap it in as the provider in main.py. See class docstring."
-        )
+        raise NotImplementedError("DatabaseSkillProvider is a stub.")
 
 
 # ---------------------------------------------------------------------------
@@ -202,16 +147,14 @@ class MatchmakingConfig:
 
     enabled: bool = False
     # Players start matchable if |rating gap| <= this, then the window
-    # widens by ``gap_widen_per_sec`` for each second waited (so nobody
-    # waits forever because they are an outlier).
+    # widens by ``gap_widen_per_sec`` for each second waited.
     max_initial_skill_gap: float = 100.0
     gap_widen_per_sec: float = 5.0
     max_skill_gap: float = 500.0
-    max_wait_ms: int = 60_000  # -> matchmaking-timeout signal, client retries
     # Optional grouping keys. Players only match within the same bucket.
     game_mode: str = "default"  # e.g. "ranked", "casual", "blitz"
     region: Optional[str] = None
-    allow_bots: bool = False  # future: fill a room with bots, not built yet
+    allow_bots: bool = False
 
     def tolerance_for_wait_ms(self, wait_ms: int) -> float:
         return min(
@@ -225,8 +168,6 @@ class TurnConfig:
     """Tuning for turn-based rooms. Only read when ``requires_turn_based``."""
 
     enabled: bool = False
-    turn_timeout_ms: Optional[int] = 30_000  # None == no deadline
-    timeout_action: Literal["pass", "forfeit", "none"] = "pass"
     max_turns: Optional[int] = None  # None == unlimited (e.g. chess-like)
     allow_pass: bool = True
     allow_resign: bool = True
@@ -234,10 +175,7 @@ class TurnConfig:
     turn_order_strategy: str = "join_order"
 
     def validate(self) -> None:
-        if self.turn_timeout_ms is not None and self.turn_timeout_ms <= 0:
-            raise ValueError("turn.turn_timeout_ms must be > 0 or null")
-        if self.timeout_action not in ("pass", "forfeit", "none"):
-            raise ValueError("turn.timeout_action must be pass/forfeit/none")
+        pass
 
 
 @dataclass
@@ -248,7 +186,7 @@ class AuthorityConfig:
     system" — asked per-application, per-connect, not hard-coded.
 
     ``scopes``: subsystems the server enforces (claims / turns / scores
-    outside the scope are relayed, never adjudicated).
+    outside the scope are relayed).
     ``resource_types``: within those scopes, which resource kinds the
     authority covers, e.g. ``["item", "character", "score"]`` or a
     game-specific ``["custom:power_up"]``. ``["*"]`` == everything.
@@ -256,7 +194,6 @@ class AuthorityConfig:
 
     scopes: List[str] = field(default_factory=lambda: ["items", "environment"])
     resource_types: List[str] = field(default_factory=lambda: ["*"])
-    claim_idle_timeout_ms: int = 10_000
     # If False, clients may not claim authority at all — the server (or
     # the turn manager) assigns it.
     allow_client_claims: bool = True
@@ -269,14 +206,9 @@ class AuthorityConfig:
 
 @dataclass
 class GameSessionConfig:
-    """Everything an application declares when it first connects.
+    """Everything an application declares when it first connects."""
 
-    This is the single generalization point: a platformer, a card game,
-    and a turn-based board game all speak the same join, they just send
-    different configs.
-    """
-
-    game_id: str = "default"  # == legacy environment_name when unset
+    game_id: str = "default"
     requires_matchmaking: bool = False
     requires_turn_based: bool = False
     max_players_per_room: int = 8
@@ -287,8 +219,7 @@ class GameSessionConfig:
     # Public rooms can be discovered / matchmade; private rooms need a code.
     visibility: Literal["public", "private"] = "public"
     room_code: Optional[str] = None  # join key for private rooms
-    # Opaque, game-specific rules. Core code MUST NOT branch on these —
-    # validators / game adapters read them.
+    # Opaque, game-specific rules. Validators / game adapters read them.
     custom_rules: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -324,9 +255,8 @@ class GameSessionConfig:
         }, sort_keys=True, default=str)
 
     @classmethod
-    def from_legacy(cls, environment_name: str) -> "GameSessionConfig":
-        """v1 client: environment == game, no match-making, no turns."""
-        return cls(game_id=environment_name or "default")
+    def default(cls, game_id: str = "") -> "GameSessionConfig":
+        return cls(game_id=game_id or "default")
 
     @classmethod
     def from_payload(cls, payload: Any) -> "GameSessionConfig":
@@ -386,16 +316,12 @@ class GameSessionConfig:
                 max_initial_skill_gap=float(matchmaking_raw.get("max_initial_skill_gap", 100.0)),
                 gap_widen_per_sec=float(matchmaking_raw.get("gap_widen_per_sec", 5.0)),
                 max_skill_gap=float(matchmaking_raw.get("max_skill_gap", 500.0)),
-                max_wait_ms=int(matchmaking_raw.get("max_wait_ms", 60_000)),
                 game_mode=str(matchmaking_raw.get("game_mode", "default")),
                 region=matchmaking_raw.get("region"),
                 allow_bots=bool(matchmaking_raw.get("allow_bots", False)),
             ),
             turn=TurnConfig(
                 enabled=bool(requires_turn),
-                turn_timeout_ms=turn_raw.get("turn_timeout_ms",
-                                             turn_raw.get("turnTimeoutMs", 30_000)),
-                timeout_action=str(turn_raw.get("timeout_action", "pass")),
                 max_turns=turn_raw.get("max_turns"),
                 allow_pass=bool(turn_raw.get("allow_pass", True)),
                 allow_resign=bool(turn_raw.get("allow_resign", True)),
@@ -405,8 +331,6 @@ class GameSessionConfig:
                 scopes=[str(s) for s in scopes],
                 resource_types=[str(r) for r in authority_raw.get(
                     "resource_types", authority_raw.get("resourceTypes", ["*"]))],
-                claim_idle_timeout_ms=int(authority_raw.get(
-                    "claim_idle_timeout_ms", authority_raw.get("claimIdleTimeoutMs", 10_000))),
                 allow_client_claims=bool(authority_raw.get("allow_client_claims", True)),
             ),
             visibility=str(_pop("visibility", default="public")),
@@ -414,7 +338,7 @@ class GameSessionConfig:
             custom_rules=dict(_pop("custom_rules", "customRules", default={}) or {}),
             metadata=dict(_pop("metadata", default={}) or {}),
         )
-        if raw:  # unknown top-level keys: keep, don't crash — forward-compat
+        if raw:  # unknown top-level keys: keep for forward-compat
             cfg.metadata.setdefault("unknown_config_keys", sorted(raw.keys()))
         cfg.validate()
         return cfg
@@ -430,10 +354,10 @@ SessionConfig = GameSessionConfig
 
 @dataclass
 class JoinRequest:
-    # Legacy fields (v1 clients send only these two).
+    # Base fields.
     environment_name: str = "default"
     character_name: str = "player"
-    # v2 fields.
+    # Extended fields.
     game_id: str = ""  # defaults to environment_name in normalize()
     player_id: str = ""  # stable per-player id for skill lookup; "" == anonymous
     display_name: str = ""
@@ -448,7 +372,7 @@ class JoinRequest:
             self.game_id = (self.config.game_id if self.config else "") \
                 or self.environment_name or "default"
         if self.config is None:
-            self.config = GameSessionConfig.from_legacy(self.game_id)
+            self.config = GameSessionConfig.default(self.game_id)
         else:
             self.config.game_id = self.game_id
             self.config.validate()
@@ -463,7 +387,7 @@ class JoinResponse:
     session_id: str
     is_synchronizer: bool
     existing_clients: int
-    # v2 fields (all optional so v1 parsing keeps working).
+    # Optional fields.
     room_id: Optional[str] = None
     game_id: str = "default"
     match_status: Literal["ready", "queued", "waiting_for_players"] = "ready"
@@ -524,15 +448,6 @@ class MatchFoundSignal:
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
-@dataclass
-class MatchmakingTimeoutSignal:
-    eventType: Literal["matchmaking_timeout"] = "matchmaking_timeout"
-    clientId: str = ""
-    gameId: str = ""
-    reason: str = "no_match_within_max_wait"
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
-
-
 # ---------- Turn-based state management (generic) ----------
 
 
@@ -547,12 +462,11 @@ class TurnState:
     current_player_id: Optional[str] = None
     turn_number: int = 0
     turn_order: List[str] = field(default_factory=list)
-    turn_deadline_ms: Optional[int] = None
     state: Dict[str, Any] = field(default_factory=dict)  # game-specific
     last_action: Optional[Dict[str, Any]] = None
     winner_id: Optional[str] = None
     is_draw: bool = False
-    end_reason: Optional[str] = None  # "win" | "draw" | "resign" | "timeout" | "max_turns"
+    end_reason: Optional[str] = None  # "win" | "draw" | "resign" | "max_turns"
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
     def is_players_turn(self, client_id: str) -> bool:
@@ -566,7 +480,7 @@ class TurnState:
 class TurnAction:
     """One move, from one player, in one room. ``payload`` is opaque to
     the core — e.g. ``{"cell": 4}`` for one game, ``{"from": "e2", "to": "e4"}``
-    for another. The core never interprets it.
+    for another. The core treats it as opaque.
 
     Two ways to run a game, both supported:
 
@@ -574,7 +488,7 @@ class TurnAction:
        the mover also sends ``proposed_state`` (the full game state after
        its move) and, if the game ended, ``claimed_winner`` /
        ``claimed_is_draw`` / ``claimed_end_reason``. The server checks
-       only turn / phase / deadline, accepts the proposed state as
+       only turn / phase, accepts the proposed state as
        canonical, and broadcasts it. Every client recomputes the same
        state from the same action stream.
     2. Server-validated (opt-in, for anti-cheat):
@@ -612,7 +526,7 @@ class TurnChangedSignal:
 
 
 class TurnValidator(Protocol):
-    """OPTIONAL server-side game rules. Most games never implement this.
+    """OPTIONAL server-side game rules.
 
     The default path is client-authoritative (see TurnAction): the server
     enforces turns and broadcasts moves without understanding them, so a
@@ -645,26 +559,24 @@ class TurnValidator(Protocol):
 
 
 # ---------- No game-specific types below this line ----------
-# Deliberately: there is no game-specific state type in this file.
 # Game state is an opaque ``Dict[str, Any]`` carried in
-# ``TurnState.state`` / ``TurnAction.proposed_state``. The server does
-# not know, and must not know, what any game's state means. The only
-# game-specific code that may ever exist is (a) an optional
+# ``TurnState.state`` / ``TurnAction.proposed_state``. The server
+# treats it as opaque. The only game-specific code is (a) an optional
 # ``TurnValidator`` for a game that wants server-side adjudication, and
 # (b) demo clients, which live outside the API entirely.
 
 
-# ---------- Character state (per-player, legacy — unchanged) ----------
+# ---------- Character state ----------
 
 
 @dataclass
 class CharacterState:
-    """Authoritative per-player state, owned by client_id. Mirrors BGS CharacterState but 2D."""
+    """Authoritative per-player state, owned by client_id."""
     clientId: str
-    characterModelId: str = "platformer-default"
+    characterModelId: str = "default"
     position: List[float] = field(default_factory=lambda: [0.0, 0.0])  # [x, y]
     velocity: List[float] = field(default_factory=lambda: [0.0, 0.0])  # [vx, vy]
-    animationState: str = "idle"  # idle, run, jump, fall
+    animationState: str = "stand"  # stand, run, jump, fall
     animationFrame: float = 0.0
     isJumping: bool = False
     facing: int = 1  # -1 left, 1 right
@@ -729,7 +641,7 @@ class CharacterStateUpdate:
 
 @dataclass
 class ItemInstanceState:
-    """Pose-only transport per BGS Invariant P. pos [x,y], rot quaternion [x,y,z,w]."""
+    """Pose-only transport. pos [x,y], rot quaternion [x,y,z,w]."""
     instanceId: str
     itemName: str = ""
     pos: List[float] = field(default_factory=lambda: [0.0, 0.0])  # world pos [x, y]
@@ -787,7 +699,7 @@ class ItemAuthorityChangedSignal:
     instanceId: str
     previousOwnerId: Optional[str]
     newOwnerId: Optional[str]
-    reason: Literal["claim", "release", "disconnect", "idle_timeout", "env_switch"]
+    reason: Literal["claim", "release", "disconnect", "transfer", "env_switch"]
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
@@ -843,16 +755,14 @@ class Capabilities:
     transport: str = "datastar-sse"
     features: Dict[str, bool] = field(default_factory=lambda: {
         "characterState": True, "itemState": True, "itemAuthority": True,
-        "envAuthority": True, "baseSynchronizer": True,
+        "envAuthority": True, "synchronizer": True,
         "matchmaking": True, "turnBased": True,
         "skillProviders": True, "rooms": True, "customGames": True,
         "websocket": False, "sse": True,
     })
     # Defaults only — each room's GameSessionConfig overrides these.
     limits: Dict[str, int] = field(default_factory=lambda: {
-        "maxClients": 16, "maxPlayersPerRoom": 8, "tickHz": 20,
-        "snapshotHz": 15, "claimIdleTimeoutMs": 10000,
-        "maxSkillGap": 500, "defaultTurnTimeoutMs": 30000,
+        "maxClients": 16, "maxPlayersPerRoom": 8,
+        "maxSkillGap": 500,
     })
     skill_sources: List[str] = field(default_factory=lambda: ["client_reported"])
-    # ^ becomes ["database"] when DatabaseSkillProvider is wired in.

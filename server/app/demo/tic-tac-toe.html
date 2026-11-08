@@ -94,13 +94,31 @@ async function join() {
   $("passBtn").disabled = false; $("resignBtn").disabled = false;
   log("joined: " + JSON.stringify(data));
   connectStream();
+  if (data.match_status !== "queued") refreshTurnState();
+}
+async function refreshTurnState() {
+  if (!clientId) return;
+  try {
+    const res = await api("/api/multiplayer/turn/state", { method: "GET" });
+    const data = await res.json();
+    if (data.turn_state) applyMp({ turnState: data.turn_state });
+  } catch (e) { log("turn state fetch: " + e); }
 }
 function applyMp(mp) {
   if (!mp) return;
+  if (mp.room && mp.room.roomId) roomId = mp.room.roomId;
   if (mp.match) {
     if (mp.match.roomId) roomId = mp.match.roomId;
     if (mp.match.status === "queued") {
       $("status").textContent = `Queued (position ${mp.match.queuePosition ?? "?"}) — waiting for an opponent…`;
+      return;
+    }
+    if (mp.match.status === "matched" || mp.match.status === "ready") {
+      $("status").textContent = "Matched!";
+      if (!mp.turnState) { refreshTurnState(); return; }
+    }
+    if (mp.match.status === "finished" && !mp.turnState) {
+      $("status").textContent = "Game over.";
       return;
     }
   }
@@ -120,17 +138,22 @@ function applyMp(mp) {
   }
   render();
 }
+function handleStreamData(raw) {
+  try {
+    let text = String(raw || "").trim();
+    if (text.startsWith("signals ")) text = text.slice("signals ".length);
+    const data = JSON.parse(text);
+    const signals = data.signals || data;
+    const mp = signals.mp || (signals.match || signals.turnState ? signals : null);
+    if (mp) applyMp(mp);
+  } catch (e) { log("stream parse: " + e); }
+}
 function connectStream() {
   if (!sessionId) return;
   if (stream) stream.close();
   stream = new EventSource(`/api/multiplayer/stream?session_id=${encodeURIComponent(sessionId)}`);
-  stream.onmessage = (ev) => {
-    try {
-      const data = JSON.parse(ev.data);
-      const signals = data.signals || {};
-      if (signals.mp) applyMp(signals.mp);
-    } catch (e) { log("stream parse: " + e); }
-  };
+  stream.addEventListener("datastar-patch-signals", (ev) => handleStreamData(ev.data));
+  stream.onmessage = (ev) => handleStreamData(ev.data);
   stream.onerror = () => { log("stream error — reconnecting on next join"); };
 }
 async function makeMove(cell) {

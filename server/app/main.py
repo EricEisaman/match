@@ -348,11 +348,6 @@ class MultiplayerRegistry:
                 session.room_id = room.room_id
                 session.seat = seat
                 session.match_status = "ready"
-                await self._send_to_client(
-                    qp.client_id, "match-found",
-                    {"eventType": "match_found", "roomId": room.room_id, "gameId": room.game_id,
-                     "playerIds": [q.client_id for q in group], "seat": seat,
-                     "turnOrder": [q.client_id for q in group], "timestamp": _now_ms()})
             await self._on_room_changed(room)
 
     def _get_or_create_direct_room(self, req: JoinRequest, config: GameSessionConfig) -> Room:
@@ -384,20 +379,9 @@ class MultiplayerRegistry:
                                             if self.clients.get(cid) and self.clients[cid].skill else 1000.0))
             room.turn_manager = TurnManager(room.room_id, order, room.config, validator)
             room.status = "in_progress"
-            await self._broadcast_to_room(room.room_id, "turn-state-update",
-                                         {"turnState": room.turn_manager.state.to_dict(),
-                                          "timestamp": _now_ms()})
-            await self._broadcast_to_room(room.room_id, "room-ready",
-                                         {"roomId": room.room_id, "gameId": room.game_id,
-                                          "playerIds": order,
-                                          "turnOrder": room.turn_manager.state.turn_order,
-                                          "timestamp": _now_ms()})
         else:
             room.status = "in_progress"
-            await self._broadcast_to_room(room.room_id, "room-ready",
-                                         {"roomId": room.room_id, "gameId": room.game_id,
-                                          "playerIds": list(room.player_ids),
-                                          "timestamp": _now_ms()})
+        await self._broadcast_room_state(room)
 
     # -- match-making helpers ---------------------------
     async def cancel_matchmaking(self, client_id: str) -> bool:
@@ -530,6 +514,8 @@ class MultiplayerRegistry:
                            "seat": payload.get("seat"), "turnOrder": payload.get("turnOrder")}
             mp["room"] = {"roomId": payload.get("roomId"), "gameId": payload.get("gameId"),
                           "playerIds": payload.get("playerIds")}
+            if payload.get("turnState") is not None:
+                mp["turnState"] = payload.get("turnState")
         elif signal_name == "turn-state-update":
             mp["turnState"] = payload.get("turnState")
         elif signal_name == "game-over":
@@ -601,14 +587,6 @@ class MultiplayerRegistry:
     @staticmethod
     def _enqueue_signal(queue: asyncio.Queue, signal_name: str, payload: Dict[str, Any]):
         try:
-            if signal_name == "mp" and payload.get("turnState") is not None:
-                for item in list(queue._queue):
-                    if item[0] == "mp" and item[1].get("turnState") is not None and "match" not in item[1]:
-                        try:
-                            queue._queue.remove(item)
-                        except ValueError:
-                            pass
-                        break
             queue.put_nowait((signal_name, payload))
         except asyncio.QueueFull:
             try:
@@ -669,6 +647,20 @@ class MultiplayerRegistry:
             return
         for client_id in room.player_ids:
             await self._send_to_client(client_id, signal_name, payload)
+
+    async def _broadcast_room_state(self, room) -> None:
+        for client_id in list(room.player_ids):
+            client = self.clients.get(client_id)
+            if not client or not client.sse_queue:
+                continue
+            mp: Dict[str, Any] = {"timestamp": _now_ms()}
+            mp["match"] = {"status": "matched", "roomId": room.room_id, "gameId": room.game_id,
+                           "playerIds": list(room.player_ids), "seat": client.seat}
+            mp["room"] = {"roomId": room.room_id, "gameId": room.game_id,
+                          "playerIds": list(room.player_ids)}
+            if room.turn_manager:
+                mp["turnState"] = room.turn_manager.state.to_dict()
+            self._enqueue_signal(client.sse_queue, "mp", mp)
 
     # -- authority gating ------------------------------------------------
     def _authority_covers(self, client: ClientSession, scope: str, resource_type: str = "*") -> bool:
