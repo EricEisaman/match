@@ -1457,6 +1457,16 @@ async def tic_tac_toe_demo_page():
     return _serve_demo_file("tic-tac-toe")
 
 
+@app.get("/top-down", include_in_schema=False)
+async def top_down_demo_page():
+    """Top-down demo — same file as /demo/top-down.
+
+    This is the URL you deployed: https://matchgod.onrender.com/top-down
+    Previously only /demo/top-down existed, so /top-down returned 404.
+    """
+    return _serve_demo_file("top-down")
+
+
 @app.get("/demo/{name}", include_in_schema=False)
 async def demo_page(name: str):
     """Generic demo loader."""
@@ -1499,7 +1509,8 @@ async def root():
             "turn_state": "GET /api/multiplayer/turn/state X-Client-ID",
             "tic_tac_toe_demo": "GET /tic-tac-toe -> demo client page (HTML, NOT an API)",
             "demo_generic": "GET /demo/{name} -> static demo client for any game",
-            "top_down_demo": "GET /demo/top-down -> top-down realtime demo (gems, squares, health bars)",
+            "top_down_demo": "GET /top-down -> top-down realtime demo (gems, squares, health bars)",
+            "top_down_demo_alias": "GET /demo/top-down -> same file",
         },
         "signals": ["mp"],
         "python_api": "extensions.multiplayer.MultiplayerClient",
