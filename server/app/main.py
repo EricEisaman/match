@@ -239,6 +239,14 @@ class ClientSession:
     created_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     sse_queue: Optional[asyncio.Queue] = None
+    # --- Disconnection (event-driven, no timer loop) ---
+    # Last ms a packet was received from this client. Updated on every
+    # inbound packet (see _touch). Checked lazily on the next packet
+    # from ANY client (see _sweep_expired_locked).
+    last_seen_ms: int = field(default_factory=_now_ms)
+    # Per-client budget from GameSessionConfig.disconnection_time_sec.
+    # Default 60. 0 == never expire.
+    disconnection_time_sec: float = 60.0
 
 
 @dataclass
@@ -283,11 +291,68 @@ class MultiplayerRegistry:
         self.running = False
         print("[SCS-MP-SYNC] Registry stopped")
 
+    # -- disconnection: event-driven, no timers -------------------------
+    def _is_expired(self, session: ClientSession, now_ms: int) -> bool:
+        dt = session.disconnection_time_sec
+        if dt is None or dt <= 0:
+            return False
+        return (now_ms - session.last_seen_ms) > dt * 1000
+
+    def _touch(self, session: ClientSession, now_ms: int) -> None:
+        session.last_seen_ms = now_ms
+        session.last_seen = now_ms / 1000.0
+
+    async def _sweep_expired_locked(self, now_ms: int, exclude: Optional[str] = None) -> List[str]:
+        """Evict every client silent longer than its own budget.
+
+        MUST be called with self._lock held. Call it at the top of every
+        packet handler, after touching the sender. No timers: the sweep
+        only runs because a packet arrived.
+        """
+        expired = [
+            cid for cid, s in list(self.clients.items())
+            if cid != exclude and self._is_expired(s, now_ms)
+        ]
+        for cid in expired:
+            await self._remove_client_locked(cid, reason="timeout", now_ms=now_ms)
+        return expired
+
+    async def _check_sender_alive_locked(self, client_id: str, now_ms: int) -> Optional[ClientSession]:
+        """If sender is already expired, evict + return None. Else touch + sweep others."""
+        sess = self.clients.get(client_id)
+        if sess is None:
+            return None
+        if self._is_expired(sess, now_ms):
+            await self._remove_client_locked(client_id, reason="timeout", now_ms=now_ms)
+            return None
+        self._touch(sess, now_ms)
+        await self._sweep_expired_locked(now_ms, exclude=client_id)
+        return sess
+
+    async def handle_heartbeat(self, client_id: str) -> Dict[str, Any]:
+        """Explicit keep-alive packet. Counts as a packet like any other."""
+        async with self._lock:
+            now = _now_ms()
+            sess = self.clients.get(client_id)
+            if not sess:
+                raise HTTPException(403, "Unknown client")
+            if self._is_expired(sess, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(sess, now)
+            expired = await self._sweep_expired_locked(now, exclude=client_id)
+            return {"ok": True, "expired": expired, "server_timestamp": now,
+                    "disconnection_time_sec": sess.disconnection_time_sec}
+
     # -- join ----------------------------------------------------------
     async def join(self, req: JoinRequest) -> JoinResponse:
         req.normalize()
         config = req.config or GameSessionConfig.default(req.game_id)
         async with self._lock:
+            now = _now_ms()
+            # New arrival is itself a packet: sweep stale clients first
+            # so existing_clients / synchronizer election are accurate.
+            await self._sweep_expired_locked(now)
             client_id = uuid.uuid4().hex[:8]
             session_id = uuid.uuid4().hex[:16]
             skill = await self.skill_provider.resolve_skill(
@@ -298,7 +363,8 @@ class MultiplayerRegistry:
                 client_id=client_id, session_id=session_id,
                 environment=req.environment_name, character_name=req.character_name,
                 is_synchronizer=is_sync, game_id=req.game_id,
-                player_id=req.player_id or client_id, config=config, skill=skill)
+                player_id=req.player_id or client_id, config=config, skill=skill,
+                last_seen_ms=now, disconnection_time_sec=config.disconnection_time_sec)
             self.clients[client_id] = session
             self.sessions[session_id] = client_id
             if is_sync:
@@ -320,7 +386,8 @@ class MultiplayerRegistry:
                                     room_id=room_id, game_id=req.game_id, match_status=status,
                                     queue_position=pos if status == "queued" else None,
                                     seat=after.seat if after else None,
-                                    skill_source=skill.source, config=config)
+                                    skill_source=skill.source, config=config,
+                                    disconnection_time_sec=config.disconnection_time_sec)
             room = self._get_or_create_direct_room(req, config)
             seat = len(room.player_ids)
             room.player_ids.append(client_id)
@@ -333,7 +400,8 @@ class MultiplayerRegistry:
                                 existing_clients=len(room.player_ids) - 1,
                                 room_id=room.room_id, game_id=req.game_id,
                                 match_status="ready", seat=seat, player_index=seat,
-                                skill_source=skill.source, config=config)
+                                skill_source=skill.source, config=config,
+                                disconnection_time_sec=config.disconnection_time_sec)
 
     async def _try_fill_queues(self, fingerprint: str) -> None:
         for group in self.matchmaker.try_form_matches(fingerprint):
@@ -388,64 +456,84 @@ class MultiplayerRegistry:
         async with self._lock:
             session = self.clients.get(client_id)
             if session:
+                # Cancel is a packet: touch, then sweep others.
+                now = _now_ms()
+                if self._is_expired(session, now):
+                    await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                    return False
+                self._touch(session, now)
+                await self._sweep_expired_locked(now, exclude=client_id)
                 session.match_status = "cancelled"
             return self.matchmaker.cancel(client_id)
 
     # -- leave / switch -------------------------------------------------
     async def leave(self, client_id: str):
         async with self._lock:
-            session = self.clients.pop(client_id, None)
-            if not session:
-                return
-            self.sessions.pop(session.session_id, None)
-            self.matchmaker.cancel(client_id)
-            if session.sse_queue:
-                self._enqueue_signal(session.sse_queue, "__close__", {})
-            session.sse_queue = None
-            if self.synchronizers.get(session.environment) == client_id:
-                remaining = [c for c in self.clients.values() if c.environment == session.environment]
-                if remaining:
-                    new_sync = remaining[0].client_id
-                    self.synchronizers[session.environment] = new_sync
-                    for c in remaining:
-                        c.is_synchronizer = (c.client_id == new_sync)
-                    await self._broadcast_signal("synchronizer-changed",
-                                                 {"newSynchronizerId": new_sync, "reason": "disconnection",
-                                                  "timestamp": _now_ms()},
-                                                 environment=session.environment)
-                else:
-                    self.synchronizers.pop(session.environment, None)
-            events = self.authority.client_leaves(client_id)
-            for ev in events:
-                if ev["type"] == "env-authority-changed":
-                    await self._broadcast_signal("env-item-authority-changed", ev,
-                                                 environment=ev.get("environmentName", session.environment))
-                elif ev["type"] == "item-authority-changed":
-                    await self._broadcast_signal("item-authority-changed", ev, environment=session.environment)
-            self.freshness.client_leaves(session.environment, client_id)
-            # Room + turn bookkeeping.
-            room = self.rooms.get(session.room_id) if session.room_id else None
-            if room and client_id in room.player_ids:
-                room.player_ids.remove(client_id)
-                if room.turn_manager and room.turn_manager.state.phase == "in_progress":
-                    fired = room.turn_manager.on_player_left(client_id)
-                    if fired:
-                        room.status = "finished"
-                        await self._broadcast_to_room(room.room_id, "game-over",
-                                                     {"roomId": room.room_id,
-                                                      "winnerId": room.turn_manager.state.winner_id,
-                                                      "isDraw": room.turn_manager.state.is_draw,
-                                                      "endReason": "opponent_left",
-                                                      "turnState": room.turn_manager.state.to_dict(),
-                                                      "timestamp": _now_ms()})
-                if not room.player_ids:
-                    self.rooms.pop(room.room_id, None)
-            await self._broadcast_signal("client-left",
-                                        {"eventType": "left", "clientId": client_id,
-                                         "totalClients": sum(s.environment == session.environment
-                                                             for s in self.clients.values()),
-                                         "timestamp": _now_ms()},
-                                        environment=session.environment)
+            await self._remove_client_locked(client_id, reason="leave")
+
+    async def _remove_client_locked(self, client_id: str, reason: str = "leave",
+                                    now_ms: Optional[int] = None) -> bool:
+        """Core removal. Caller must hold self._lock.
+
+        reason: "leave" | "timeout" | "env_switch" | "disconnect".
+        For "timeout" the broadcast client-left carries reason="timeout"
+        so demos can show 'dropped: timeout'.
+        """
+        now = now_ms if now_ms is not None else _now_ms()
+        session = self.clients.pop(client_id, None)
+        if not session:
+            return False
+        self.sessions.pop(session.session_id, None)
+        self.matchmaker.cancel(client_id)
+        if session.sse_queue:
+            self._enqueue_signal(session.sse_queue, "__close__", {})
+        session.sse_queue = None
+        if self.synchronizers.get(session.environment) == client_id:
+            remaining = [c for c in self.clients.values() if c.environment == session.environment]
+            if remaining:
+                new_sync = remaining[0].client_id
+                self.synchronizers[session.environment] = new_sync
+                for c in remaining:
+                    c.is_synchronizer = (c.client_id == new_sync)
+                await self._broadcast_signal("synchronizer-changed",
+                                             {"newSynchronizerId": new_sync, "reason": "disconnection",
+                                              "timestamp": now},
+                                             environment=session.environment)
+            else:
+                self.synchronizers.pop(session.environment, None)
+        events = self.authority.client_leaves(client_id)
+        for ev in events:
+            if ev["type"] == "env-authority-changed":
+                await self._broadcast_signal("env-item-authority-changed", ev,
+                                             environment=ev.get("environmentName", session.environment))
+            elif ev["type"] == "item-authority-changed":
+                await self._broadcast_signal("item-authority-changed", ev, environment=session.environment)
+        self.freshness.client_leaves(session.environment, client_id)
+        # Room + turn bookkeeping.
+        room = self.rooms.get(session.room_id) if session.room_id else None
+        if room and client_id in room.player_ids:
+            room.player_ids.remove(client_id)
+            if room.turn_manager and room.turn_manager.state.phase == "in_progress":
+                fired = room.turn_manager.on_player_left(client_id)
+                if fired:
+                    room.status = "finished"
+                    await self._broadcast_to_room(room.room_id, "game-over",
+                                                 {"roomId": room.room_id,
+                                                  "winnerId": room.turn_manager.state.winner_id,
+                                                  "isDraw": room.turn_manager.state.is_draw,
+                                                  "endReason": "opponent_left",
+                                                  "turnState": room.turn_manager.state.to_dict(),
+                                                  "timestamp": now})
+            if not room.player_ids:
+                self.rooms.pop(room.room_id, None)
+        await self._broadcast_signal("client-left",
+                                    {"eventType": "left", "clientId": client_id,
+                                     "totalClients": sum(s.environment == session.environment
+                                                         for s in self.clients.values()),
+                                     "reason": reason,
+                                     "timestamp": now},
+                                    environment=session.environment)
+        return True
 
     async def get_client_by_session(self, session_id: str) -> Optional[ClientSession]:
         client_id = self.sessions.get(session_id)
@@ -459,6 +547,12 @@ class MultiplayerRegistry:
             client = self.clients.get(client_id)
             if not client:
                 raise HTTPException(403, "Unknown client")
+            now = _now_ms()
+            if self._is_expired(client, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(client, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             if not environment or environment == client.environment:
                 return client.environment
             previous_environment = client.environment
@@ -556,7 +650,8 @@ class MultiplayerRegistry:
             "connection": {"clientId": client.client_id, "sessionId": client.session_id,
                            "isSynchronizer": client.is_synchronizer, "environment": env_name,
                            "roomId": client.room_id, "gameId": client.game_id,
-                           "matchStatus": client.match_status},
+                           "matchStatus": client.match_status,
+                           "disconnectionTimeSec": client.disconnection_time_sec},
             "clients": [{"clientId": c.client_id, "character": c.character_name,
                          "environment": c.environment}
                         for c in self.clients.values() if c.environment == env_name],
@@ -608,6 +703,12 @@ class MultiplayerRegistry:
             client = self.clients.get(client_id)
             if not client:
                 raise HTTPException(401, "Unknown client_id")
+            now = _now_ms()
+            if self._is_expired(client, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(client, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             if client.sse_queue:
                 self._enqueue_signal(client.sse_queue, "__close__", {})
             queue = asyncio.Queue(maxsize=64)
@@ -624,7 +725,31 @@ class MultiplayerRegistry:
     def _bootstrap_for_client(self, client: ClientSession):
         return [("mp", self._mp_for_client(client))]
 
+    # -- items: binding ---------------------------------------------------
+    def _item_env_allows(self, instance_id: str, env_name: str) -> bool:
+        """True if this item may live in env_name.
+
+        Bound items must match their bound env. Unbound items bind on
+        first sight (first writer wins), unless the id is prefixed with
+        a *known other* env (e.g. "other-env:gem-1" in "top-down-demo").
+        This is what makes bare ids like "gem-1" work: they bind to the
+        sender's env instead of being dropped for missing the prefix.
+        """
+        bound = self.item_environments.get(str(instance_id))
+        if bound:
+            return bound == env_name
+        if ":" in str(instance_id):
+            prefix = str(instance_id).split(":", 1)[0]
+            if prefix != env_name and prefix in self.envAuthority:
+                return False
+        return True
+
+    def _ensure_item_env(self, instance_id: str, env_name: str) -> None:
+        self.item_environments.setdefault(str(instance_id), env_name)
+
     def _item_belongs_to_environment(self, instance_id: str, environment: str) -> bool:
+        # Used for bootstrap filtering: unbound items are not yet assigned,
+        # so they do not belong to any env until first bound.
         item_environment = self.item_environments.get(str(instance_id))
         if item_environment:
             return item_environment == environment
@@ -671,9 +796,15 @@ class MultiplayerRegistry:
     # -- state handlers ------------------------
     async def handle_character_state(self, client_id: str, updates: List[Dict]):
         async with self._lock:
-            if client_id not in self.clients:
+            now = _now_ms()
+            sess = self.clients.get(client_id)
+            if sess is None:
                 raise HTTPException(403, "Unknown client")
-            session = self.clients[client_id]
+            if self._is_expired(sess, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(sess, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             parsed_updates = []
             for update in updates:
                 try:
@@ -688,23 +819,29 @@ class MultiplayerRegistry:
             await self._broadcast_signal("character-state-update",
                                         {"updates": [s.to_dict() for s in parsed_updates],
                                          "timestamp": _now_ms()},
-                                        environment=session.environment)
+                                        environment=sess.environment)
 
     async def handle_item_state(self, client_id: str, updates: List[Dict], collections: List[Dict]):
         async with self._lock:
+            now = _now_ms()
             session = self.clients.get(client_id)
             if not session:
                 raise HTTPException(403, "Unknown client")
+            if self._is_expired(session, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(session, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             env_name = session.environment
             accepted_updates, accepted_collections = [], []
             for row in updates:
                 iid = row.get("instanceId")
                 if not iid:
                     continue
-                if iid not in self.item_environments and row.get("environment") == env_name:
-                    self._bind_item_environment(iid, env_name)
-                if not self._item_belongs_to_environment(iid, env_name):
+                # Binding: first sight wins. Bare ids bind to sender env.
+                if not self._item_env_allows(iid, env_name):
                     continue
+                self._ensure_item_env(iid, env_name)
                 if row.get("environment") not in (None, env_name):
                     continue
                 # Authority-gated: rooms without items coverage relay nothing.
@@ -715,9 +852,15 @@ class MultiplayerRegistry:
                     continue  # silently drop per §7.5
                 cached = self.item_cache.get(iid)
                 if cached and cached.get("isCollected"):
-                    row = dict(row)
-                    row["isCollected"] = True
-                    row["collectedByClientId"] = cached.get("collectedByClientId", "")
+                    # Collected gems stay collected unless the env
+                    # authority explicitly respawns them.
+                    if row.get("isCollected") is False:
+                        # Respawn allowed only for the authority.
+                        pass
+                    else:
+                        row = dict(row)
+                        row["isCollected"] = True
+                        row["collectedByClientId"] = cached.get("collectedByClientId", "")
                 row = dict(row)
                 row["environment"] = env_name
                 if self.dirty_filter.is_dirty(iid, row):
@@ -732,10 +875,9 @@ class MultiplayerRegistry:
                 iid = coll.get("instanceId")
                 if not iid:
                     continue
-                if iid not in self.item_environments and coll.get("environment") == env_name:
-                    self._bind_item_environment(iid, env_name)
-                if not self._item_belongs_to_environment(iid, env_name):
+                if not self._item_env_allows(iid, env_name):
                     continue
+                self._ensure_item_env(iid, env_name)
                 if coll.get("environment") not in (None, env_name):
                     continue
                 if not self._authority_covers(session, "items", "item"):
@@ -757,6 +899,8 @@ class MultiplayerRegistry:
                     self.item_cache[iid] = {"instanceId": iid, "isCollected": True,
                                             "collectedByClientId": client_id, "environment": env_name}
                 self._bind_item_environment(iid, env_name)
+                # Keep the dirty cache in sync so a later update cannot resurrect it.
+                self.dirty_filter.cache[iid] = dict(self.item_cache[iid])
             if accepted_updates or accepted_collections:
                 await self._broadcast_signal("item-state-update",
                                             {"updates": accepted_updates, "collections": accepted_collections,
@@ -765,9 +909,15 @@ class MultiplayerRegistry:
 
     async def handle_item_claim(self, client_id: str, claim: Dict) -> Dict:
         async with self._lock:
+            now = _now_ms()
             session = self.clients.get(client_id)
             if not session:
                 raise HTTPException(403, "Unknown client")
+            if self._is_expired(session, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(session, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             iid = claim.get("instanceId")
             if not iid:
                 raise HTTPException(400, "Missing instanceId")
@@ -775,8 +925,9 @@ class MultiplayerRegistry:
                 return {"ok": False, "accepted": False, "instanceId": iid, "reason": "authority_not_enabled"}
             if not session.config.authority.allow_client_claims:
                 return {"ok": False, "accepted": False, "instanceId": iid, "reason": "client_claims_disabled"}
-            if not self._item_belongs_to_environment(iid, session.environment):
+            if not self._item_env_allows(iid, session.environment):
                 return {"ok": False, "accepted": False, "instanceId": iid, "reason": "wrong_environment"}
+            self._ensure_item_env(iid, session.environment)
             result = self.authority.claim(iid, client_id)
             if result["accepted"]:
                 if not result.get("already_owned"):
@@ -792,13 +943,19 @@ class MultiplayerRegistry:
 
     async def handle_item_release(self, client_id: str, release: Dict) -> Dict:
         async with self._lock:
+            now = _now_ms()
             session = self.clients.get(client_id)
             if not session:
                 raise HTTPException(403, "Unknown client")
+            if self._is_expired(session, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(session, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             iid = release.get("instanceId")
             if not iid:
                 raise HTTPException(400, "Missing instanceId")
-            if not self._item_belongs_to_environment(iid, session.environment):
+            if not self._item_env_allows(iid, session.environment):
                 return {"ok": False, "released": False, "instanceId": iid, "reason": "wrong_environment"}
             result = self.authority.release(iid, client_id)
             if result.get("released"):
@@ -811,9 +968,15 @@ class MultiplayerRegistry:
 
     async def handle_custom_state(self, client_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
         async with self._lock:
+            now = _now_ms()
             session = self.clients.get(client_id)
             if not session:
                 raise HTTPException(403, "Unknown client")
+            if self._is_expired(session, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(session, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             if not session.room_id or session.room_id not in self.rooms:
                 raise HTTPException(404, "Client is not in a room")
             room = self.rooms[session.room_id]
@@ -827,9 +990,15 @@ class MultiplayerRegistry:
     # -- turn-based handlers (generic) -----------------------------------
     async def handle_turn_action(self, client_id: str, action: TurnAction) -> TurnActionResponse:
         async with self._lock:
+            now = _now_ms()
             session = self.clients.get(client_id)
             if not session:
                 raise HTTPException(403, "Unknown client")
+            if self._is_expired(session, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(session, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
             if not session.room_id or session.room_id not in self.rooms:
                 raise HTTPException(404, "Client is not in a room")
             room = self.rooms[session.room_id]
@@ -855,13 +1024,23 @@ class MultiplayerRegistry:
             return resp
 
     async def get_turn_state(self, client_id: str) -> TurnState:
-        session = self.clients.get(client_id)
-        if not session or not session.room_id or session.room_id not in self.rooms:
-            raise HTTPException(404, "Client is not in a room")
-        room = self.rooms[session.room_id]
-        if not room.turn_manager:
-            raise HTTPException(409, "Room is not turn-based")
-        return room.turn_manager.state
+        # GET counts as a packet for liveness (it carries X-Client-ID).
+        async with self._lock:
+            now = _now_ms()
+            session = self.clients.get(client_id)
+            if not session:
+                raise HTTPException(403, "Unknown client")
+            if self._is_expired(session, now):
+                await self._remove_client_locked(client_id, reason="timeout", now_ms=now)
+                raise HTTPException(403, "disconnected: timeout")
+            self._touch(session, now)
+            await self._sweep_expired_locked(now, exclude=client_id)
+            if not session.room_id or session.room_id not in self.rooms:
+                raise HTTPException(404, "Client is not in a room")
+            room = self.rooms[session.room_id]
+            if not room.turn_manager:
+                raise HTTPException(409, "Room is not turn-based")
+            return room.turn_manager.state
 
 # ---------------------------------------------------------------------------
 # App
@@ -924,6 +1103,12 @@ def _join_request_from_body(body: "JoinBody") -> JoinRequest:
             "turn": raw.get("turn") or {},
             "authority": raw.get("authority") or {},
         })
+    # Flat disconnectionTime alongside the body (without nested config).
+    if config is None and raw.get("disconnectionTime") is not None:
+        config = GameSessionConfig.from_payload({
+            "game_id": raw.get("game_id") or raw.get("environment_name") or "default",
+            "disconnectionTime": raw.get("disconnectionTime"),
+        })
     game_id = raw.get("game_id") or raw.get("environment_name") or "default"
     return JoinRequest(
         environment_name=raw.get("environment_name") or game_id,
@@ -961,6 +1146,8 @@ class JoinBody(BaseModel):
     room_id: Optional[str] = None
     room_code: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    disconnectionTime: Optional[float] = None
+    disconnection_time_sec: Optional[float] = None
 
 
 class EnvironmentSwitchBody(BaseModel):
@@ -980,7 +1167,8 @@ async def join(request: Request, body: JoinBody):
             "room_id": res.room_id, "game_id": res.game_id, "match_status": res.match_status,
             "queue_position": res.queue_position, "seat": res.seat,
             "player_index": res.player_index, "turn_order": res.turn_order,
-            "skill_source": res.skill_source}
+            "skill_source": res.skill_source,
+            "disconnection_time_sec": res.disconnection_time_sec}
 
 
 @bgs_router.post("/leave")
@@ -991,6 +1179,20 @@ async def leave(request: Request, body: Optional[Dict[str, Any]] = None):
     registry: MultiplayerRegistry = request.app.state.mp
     await registry.leave(cid)
     return {"ok": True}
+
+
+@bgs_router.post("/heartbeat")
+async def heartbeat(request: Request):
+    """Keep-alive packet. Updates last_seen, sweeps expired clients.
+
+    Send this when idle instead of spamming character-state. No timers
+    on the server: this handler is what triggers the sweep.
+    """
+    cid = _client_id_from(request)
+    if not cid:
+        raise HTTPException(400, "Missing X-Client-ID")
+    registry: MultiplayerRegistry = request.app.state.mp
+    return await registry.handle_heartbeat(cid)
 
 
 @bgs_router.post("/matchmaking/cancel")
@@ -1218,6 +1420,14 @@ async def effects_state(request: Request, body: EffectsBody):
     session = registry.clients.get(cid)
     if not session:
         raise HTTPException(403, "Unknown client")
+    # Effects is a packet: touch + sweep like the other handlers.
+    async with registry._lock:
+        now = _now_ms()
+        if registry._is_expired(session, now):
+            await registry._remove_client_locked(cid, reason="timeout", now_ms=now)
+            raise HTTPException(403, "disconnected: timeout")
+        registry._touch(session, now)
+        await registry._sweep_expired_locked(now, exclude=cid)
     await registry._broadcast_signal("effects-state-update", body.model_dump(),
                                      environment=session.environment)
     return {"ok": True}
@@ -1277,6 +1487,7 @@ async def root():
             "join": "POST /api/multiplayer/join {environment_name, character_name, game_id?, player_id?, skill?, config?}",
             "join_flat": "POST /api/multiplayer/join {environment_name, requires_matchmaking, requires_turn_based, max_players_per_room, authority, skill}",
             "leave": "POST /api/multiplayer/leave X-Client-ID",
+            "heartbeat": "POST /api/multiplayer/heartbeat X-Client-ID (keep-alive, triggers disconnect sweep)",
             "matchmaking_status": "GET /api/multiplayer/matchmaking/status X-Client-ID",
             "matchmaking_cancel": "POST /api/multiplayer/matchmaking/cancel X-Client-ID",
             "stream": "GET /api/multiplayer/stream?session_id=... (signal: mp)",
@@ -1288,6 +1499,7 @@ async def root():
             "turn_state": "GET /api/multiplayer/turn/state X-Client-ID",
             "tic_tac_toe_demo": "GET /tic-tac-toe -> demo client page (HTML, NOT an API)",
             "demo_generic": "GET /demo/{name} -> static demo client for any game",
+            "top_down_demo": "GET /demo/top-down -> top-down realtime demo (gems, squares, health bars)",
         },
         "signals": ["mp"],
         "python_api": "extensions.multiplayer.MultiplayerClient",

@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Top-Down — Demo Client</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 1.5rem auto; padding: 0 1rem; background: #121214; color: #e8e8e8; }
+  .panel { background: #1e2230; border: 1px solid #2f3a5a; color: #d6e0ff; padding: .75rem 1rem; border-radius: 8px; font-size: .9rem; }
+  .panel code { background: #121214; color: #e8e8e8; padding: 0 .25rem; border-radius: 4px; }
+  #game { display: block; width: 100%; max-width: 800px; height: 600px; background: #0f1410; border: 1px solid #444; border-radius: 8px; margin: 1rem 0; }
+  #status { font-weight: 600; margin: .5rem 0; }
+  #hud { display: flex; gap: 1rem; flex-wrap: wrap; font-size: .9rem; color: #d6e0ff; }
+  #log { white-space: pre-wrap; background: #0a0a0a; color: #d6ffd6; padding: .75rem; border-radius: 8px; font-size: .8rem; max-height: 220px; overflow: auto; }
+  input, button { padding: .5rem .75rem; font-size: 1rem; margin: .25rem 0; background: #1e1e22; color: #e8e8e8; border: 1px solid #444; border-radius: 6px; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  kbd { background: #1e1e22; border: 1px solid #555; border-radius: 4px; padding: 0 .3rem; }
+</style>
+</head>
+<body>
+<h1>Top-Down — realtime demo</h1>
+<p class="panel">
+  4-way scroller. Move with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys.
+  Walk over a <code>gem</code> to collect it. Gems are <code>item-state</code> —
+  <code>updates</code> spawn them, <code>collections</code> collect them.
+  No timers anywhere: movement is
+  <code>keydown</code>/<code>keyup</code> + <code>requestAnimationFrame</code>,
+  disconnect is enforced by the server on the next packet (see below).
+</p>
+<div>
+  <label>Name <input id="name" value="player" /></label>
+  <label>Skill <input id="skill" type="number" value="1000" style="width:90px" /></label>
+  <label>DisconnectionTime (sec) <input id="disconnectSec" type="number" value="60" min="0" style="width:90px" /></label>
+  <button id="joinBtn">Join</button>
+  <button id="leaveBtn" disabled>Leave</button>
+  <button id="spawnBtn" disabled>Spawn gems (synchronizer)</button>
+  <button id="heartbeatBtn" disabled>Heartbeat</button>
+</div>
+<div id="status">Not joined.</div>
+<div id="hud">
+  <span id="hudScore">Gems: 0</span>
+  <span id="hudPlayers">Players: 0</span>
+  <span id="hudGems">Gems on map: 0</span>
+  <span id="hudSync">Synchronizer: —</span>
+  <span id="hudDisconnect">Drop if silent: 60s</span>
+</div>
+<canvas id="game" width="800" height="600"></canvas>
+<p class="panel" style="font-size:.85rem">
+  <b>Disconnect rule:</b> the server stores <code>last_seen</code> per client and
+  <code>disconnectionTime</code> from your <code>config</code> (default 60s).
+  On <i>every</i> inbound packet from <i>any</i> client it sweeps expired clients
+  and evicts them with <code>reason: "timeout"</code>. There is no timer loop.
+  If nobody sends a packet, an idle client stays listed until the next packet
+  arrives — that is the event-driven tradeoff. Your own late packet is rejected
+  (<code>403 disconnected: timeout</code>) instead of reviving you. Keep-alive is
+  just another packet: this demo sends <code>character-state</code> while moving
+  and <code>/heartbeat</code> from the <code>rAF</code> loop when idle.
+</p>
+<h3>Log</h3>
+<pre id="log"></pre>
+<script>
+// ---------------------------------------------------------------------------
+// Top-down demo — realtime, event-driven only. No timers.
+// ---------------------------------------------------------------------------
+const WORLD_W = 2000, WORLD_H = 2000;
+const SPEED = 220; // px/sec
+const PLAYER_SIZE = 32;
+const GEM_RADIUS = 14;
+let clientId = null, sessionId = null, roomId = null;
+let isSynchronizer = false;
+let stream = null;
+let keys = new Set();
+let gemCounter = 0;
+let lastSentMs = 0, lastPacketMs = 0, lastFrameMs = 0;
+let rafId = 0;
+const me = { x: WORLD_W / 2, y: WORLD_H / 2, vx: 0, vy: 0, health: 100, score: 0, name: "player", color: "#4da3ff" };
+const players = new Map(); // clientId -> {x,y,health,score,name,color,character}
+const gems = new Map(); // instanceId -> {x,y,isCollected}
+const pendingCollections = new Set();
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $("log").textContent += msg + "\n"; $("log").scrollTop = 1e9; };
+const api = (path, opts = {}) => fetch(path, {
+  ...opts,
+  headers: { "Content-Type": "application/json", ...(clientId ? { "X-Client-ID": clientId } : {}), ...(opts.headers || {}) },
+});
+function colorFor(id) {
+  let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `hsl(${h % 360} 70% 55%)`;
+}
+function randomPos() { return { x: 80 + Math.random() * (WORLD_W - 160), y: 80 + Math.random() * (WORLD_H - 160) }; }
+// --- join / leave ---------------------------------------------------------
+async function join() {
+  const name = $("name").value || "player";
+  const skill = Number($("skill").value || 1000);
+  const disconnectSec = Number($("disconnectSec").value || 60);
+  me.name = name; me.color = colorFor("me-" + name);
+  me.x = WORLD_W / 2 + (Math.random() * 120 - 60);
+  me.y = WORLD_H / 2 + (Math.random() * 120 - 60);
+  me.score = 0; me.health = 100;
+  const res = await api("/api/multiplayer/join", { method: "POST", body: JSON.stringify({
+    environment_name: "top-down-demo",
+    character_name: name,
+    game_id: "top-down-demo",
+    player_id: "demo-" + name.toLowerCase().replace(/\W+/g, "-") + "-" + Math.random().toString(36).slice(2, 6),
+    display_name: name,
+    skill: { rating: skill },
+    config: {
+      game_id: "top-down-demo",
+      requires_matchmaking: false,
+      requires_turn_based: false,
+      max_players_per_room: 8,
+      min_players_per_room: 1,
+      // NEW: per-game disconnect budget. Server enforces it lazily on next packet.
+      disconnectionTime: disconnectSec,
+      disconnection_time_sec: disconnectSec,
+      authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
+    },
+  })});
+  const data = await res.json();
+  if (!res.ok) { log("join failed: " + JSON.stringify(data)); return; }
+  clientId = data.client_id; sessionId = data.session_id; roomId = data.room_id || null;
+  isSynchronizer = !!data.is_synchronizer;
+  $("status").textContent = `Joined as ${name} · Room ${roomId || ""} · ${isSynchronizer ? "synchronizer" : "client"}`;
+  $("hudDisconnect").textContent = `Drop if silent: ${data.disconnection_time_sec ?? disconnectSec}s`;
+  $("joinBtn").disabled = true; $("leaveBtn").disabled = false;
+  $("spawnBtn").disabled = !isSynchronizer; $("heartbeatBtn").disabled = false;
+  $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you" : "other"}`;
+  log("joined: " + JSON.stringify(data));
+  players.set(clientId, { x: me.x, y: me.y, health: me.health, score: me.score, name: me.name, color: me.color });
+  connectStream();
+  // Synchronizer spawns the initial gem field. Everyone else waits for item-state.
+  if (isSynchronizer && gems.size === 0) await spawnGems(24);
+  lastPacketMs = performance.now();
+  lastFrameMs = performance.now();
+  if (!rafId) rafId = requestAnimationFrame(tick);
+}
+async function leave() {
+  if (stream) { stream.close(); stream = null; }
+  cancelAnimationFrame(rafId); rafId = 0;
+  try { await api("/api/multiplayer/leave", { method: "POST", body: "{}" }); } catch (e) {}
+  clientId = sessionId = roomId = null; isSynchronizer = false;
+  players.clear(); gems.clear(); pendingCollections.clear(); keys.clear();
+  $("status").textContent = "Left."; $("hudSync").textContent = "Synchronizer: —";
+  $("joinBtn").disabled = false; $("leaveBtn").disabled = true;
+  $("spawnBtn").disabled = true; $("heartbeatBtn").disabled = true;
+  draw();
+}
+// --- items: spawn + collect -------------------------------------------------
+// Spawn = item-state updates. instanceId is namespaced to the environment
+// so the server's _item_belongs_to_environment() accepts it. We always send
+// `environment` explicitly too — that is what binds a fresh item to this env.
+async function spawnGems(count) {
+  if (!clientId || !isSynchronizer) return;
+  const updates = [];
+  for (let i = 0; i < count; i++) {
+    gemCounter += 1;
+    const p = randomPos();
+    const id = `top-down-demo:gem-${gemCounter}`;
+    gems.set(id, { x: p.x, y: p.y, isCollected: false });
+    updates.push({ instanceId: id, itemName: "gem", pos: [p.x, p.y], rot: [0, 0, 0, 1], isCollected: false, environment: "top-down-demo" });
+  }
+  const res = await api("/api/multiplayer/item-state", { method: "PATCH", body: JSON.stringify({ updates, collections: [], timestamp: Date.now() }) });
+  log(`spawned ${count} gems -> ` + res.status);
+  lastPacketMs = performance.now();
+}
+// Collect = item-state collections, NOT an update. The server accepts a
+// collection from any player (no ownership check on collections), marks the
+// item collected exactly once, and broadcasts it. Position updates still
+// require the env authority, so only the synchronizer moves/spawns gems.
+async function collectGem(instanceId) {
+  if (pendingCollections.has(instanceId)) return;
+  pendingCollections.add(instanceId);
+  const res = await api("/api/multiplayer/item-state", { method: "PATCH", body: JSON.stringify({
+    updates: [], collections: [{ instanceId, collectedByClientId: clientId, environment: "top-down-demo" }], timestamp: Date.now(),
+  })});
+  lastPacketMs = performance.now();
+  if (!res.ok) { pendingCollections.delete(instanceId); log("collect failed: " + res.status); }
+}
+async function sendHeartbeat() {
+  if (!clientId) return;
+  const res = await api("/api/multiplayer/heartbeat", { method: "POST", body: "{}" });
+  const data = await res.json().catch(() => ({}));
+  log("heartbeat -> " + JSON.stringify(data));
+  lastPacketMs = performance.now();
+  if (res.status === 403) { log("heartbeat rejected — you were evicted for timeout, re-join."); await leave(); }
+}
+// --- character state --------------------------------------------------------
+async function sendCharacterState(force) {
+  if (!clientId) return;
+  const now = performance.now();
+  if (!force && now - lastSentMs < 50) return; // rAF timestamp throttle, not a timer
+  lastSentMs = now; lastPacketMs = now;
+  const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
+    updates: [{ clientId, characterModelId: "square", position: [me.x, me.y], velocity: [me.vx, me.vy],
+      animationState: (me.vx || me.vy) ? "run" : "stand", animationFrame: 0, isJumping: false,
+      facing: me.vx < 0 ? -1 : 1, score: me.score, health: me.health, onGround: true, timestamp: Date.now(),
+      metadata: { health: me.health, name: me.name, color: me.color } }],
+    timestamp: Date.now(),
+  })});
+  if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
+}
+// --- SSE / mp signal --------------------------------------------------------
+function handleStreamData(raw) {
+  try {
+    let text = String(raw || "").trim();
+    if (text.startsWith("signals ")) text = text.slice("signals ".length);
+    const data = JSON.parse(text);
+    const signals = data.signals || data;
+    const mp = signals.mp || (signals.match || signals.turnState || signals.characters || signals.items ? signals : null);
+    if (mp) applyMp(mp);
+  } catch (e) { log("stream parse: " + e); }
+}
+function connectStream() {
+  if (!sessionId) return;
+  if (stream) stream.close();
+  stream = new EventSource(`/api/multiplayer/stream?session_id=${encodeURIComponent(sessionId)}`);
+  stream.addEventListener("datastar-patch-signals", (ev) => handleStreamData(ev.data));
+  stream.onmessage = (ev) => handleStreamData(ev.data);
+  stream.onerror = () => { log("stream error — EventSource will retry"); };
+}
+function applyMp(mp) {
+  if (!mp) return;
+  if (mp.connection) {
+    if (typeof mp.connection.isSynchronizer === "boolean" && mp.connection.isSynchronizer !== isSynchronizer) {
+      isSynchronizer = mp.connection.isSynchronizer;
+      $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you (failover)" : "other"}`;
+      $("spawnBtn").disabled = !isSynchronizer;
+      // Failover: new synchronizer tops up the field if it went empty.
+      if (isSynchronizer && gems.size === 0) spawnGems(24);
+    }
+    if (mp.connection.roomId) roomId = mp.connection.roomId;
+  }
+  // Characters: full snapshot in bootstrap, patches after. Never trust a
+  // character update for yourself — your local pos is authoritative for you.
+  if (Array.isArray(mp.characters)) {
+    for (const c of mp.characters) {
+      if (!c || !c.clientId || c.clientId === clientId) continue;
+      const meta = c.metadata || {};
+      players.set(c.clientId, { x: (c.position || [0, 0])[0], y: (c.position || [0, 0])[1],
+        health: c.health ?? meta.health ?? 100, score: c.score ?? 0,
+        name: meta.name || c.characterModelId || "player", color: meta.color || colorFor(c.clientId) });
+    }
+  }
+  // Items: updates = spawn / move, collections = collected exactly once.
+  if (mp.items) {
+    if (Array.isArray(mp.items.updates)) {
+      for (const row of mp.items.updates) {
+        if (!row || !row.instanceId) continue;
+        if (row.isCollected) { gems.delete(row.instanceId); pendingCollections.delete(row.instanceId); continue; }
+        if (Array.isArray(row.pos) && row.pos.length === 2) gems.set(row.instanceId, { x: row.pos[0], y: row.pos[1], isCollected: false });
+      }
+    }
+    if (Array.isArray(mp.items.collections)) {
+      for (const coll of mp.items.collections) {
+        if (!coll || !coll.instanceId) continue;
+        const wasMine = coll.collectedByClientId === clientId;
+        gems.delete(coll.instanceId); pendingCollections.delete(coll.instanceId);
+        if (wasMine) { me.score += 1; $("hudScore").textContent = `Gems: ${me.score}`; sendCharacterState(true); }
+        // Synchronizer keeps the field populated: one new gem per collection.
+        // New instanceId each time, so we never need to un-collect an old row.
+        if (isSynchronizer) spawnGems(1);
+      }
+    }
+  }
+  if (mp.clientJoined) { log("joined: " + mp.clientJoined.clientId); }
+  if (mp.clientLeft) {
+    const id = mp.clientLeft.clientId;
+    if (id && id !== clientId) players.delete(id);
+    if (mp.clientLeft.reason === "timeout") log(`player ${id} dropped: timeout (no packet in disconnectionTime)`);
+    else log("left: " + id);
+  }
+  if (mp.synchronizer) { log("synchronizer -> " + JSON.stringify(mp.synchronizer)); }
+  if (mp.itemAuthority) { /* authority change — gems stay collected, no action needed */ }
+  updateHud();
+}
+function updateHud() {
+  $("hudPlayers").textContent = `Players: ${players.size}`;
+  $("hudGems").textContent = `Gems on map: ${gems.size}`;
+  $("hudScore").textContent = `Gems: ${me.score}`;
+}
+// --- input + game loop (rAF only) -------------------------------------------
+addEventListener("keydown", (e) => {
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+  keys.add(e.key.toLowerCase());
+});
+addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+function tick(now) {
+  rafId = requestAnimationFrame(tick);
+  if (!clientId) { draw(); return; }
+  const dt = Math.min(0.05, (now - lastFrameMs) / 1000 || 0.016);
+  lastFrameMs = now;
+  let dx = 0, dy = 0;
+  if (keys.has("a") || keys.has("arrowleft")) dx -= 1;
+  if (keys.has("d") || keys.has("arrowright")) dx += 1;
+  if (keys.has("w") || keys.has("arrowup")) dy -= 1;
+  if (keys.has("s") || keys.has("arrowdown")) dy += 1;
+  const len = Math.hypot(dx, dy) || 1;
+  me.vx = (dx / len) * (dx || dy ? SPEED : 0);
+  me.vy = (dy / len) * (dx || dy ? SPEED : 0);
+  me.x = Math.max(16, Math.min(WORLD_W - 16, me.x + me.vx * dt));
+  me.y = Math.max(16, Math.min(WORLD_H - 16, me.y + me.vy * dt));
+  const moved = me.vx !== 0 || me.vy !== 0;
+  // Gem collision — local check, server confirms via collections broadcast.
+  for (const [id, g] of [...gems.entries()]) {
+    if (Math.hypot(g.x - me.x, g.y - me.y) < 28) collectGem(id);
+  }
+  if (moved) sendCharacterState(false);
+  // Idle keep-alive: rAF timestamp check, not a timer. If we have not sent
+  // any packet in 10s while the tab is open, send a heartbeat packet.
+  // If the tab is closed / network is dead, no packet arrives and the
+  // server will sweep us on the next packet from anyone else.
+  else if (now - lastPacketMs > 10000) sendHeartbeat();
+  draw();
+}
+// --- render: square + health bar on top + name below ------------------------
+function draw() {
+  const canvas = $("game"), ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  // Camera follows local player — this is the "scroller".
+  const camX = Math.max(0, Math.min(WORLD_W - W, me.x - W / 2));
+  const camY = Math.max(0, Math.min(WORLD_H - H, me.y - H / 2));
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0f1410"; ctx.fillRect(0, 0, W, H);
+  // Grid — makes scrolling visible.
+  ctx.strokeStyle = "#1e2a22"; ctx.lineWidth = 1;
+  for (let gx = Math.floor(camX / 100) * 100; gx < camX + W; gx += 100) { ctx.beginPath(); ctx.moveTo(gx - camX, 0); ctx.lineTo(gx - camX, H); ctx.stroke(); }
+  for (let gy = Math.floor(camY / 100) * 100; gy < camY + H; gy += 100) { ctx.beginPath(); ctx.moveTo(0, gy - camY); ctx.lineTo(W, gy - camY); ctx.stroke(); }
+  // World border.
+  ctx.strokeStyle = "#3a4a3a"; ctx.lineWidth = 3; ctx.strokeRect(-camX, -camY, WORLD_W, WORLD_H);
+  // Gems — diamonds.
+  for (const g of gems.values()) {
+    const sx = g.x - camX, sy = g.y - camY;
+    if (sx < -20 || sy < -20 || sx > W + 20 || sy > H + 20) continue;
+    ctx.save(); ctx.translate(sx, sy); ctx.rotate(Math.PI / 4);
+    ctx.fillStyle = "#22d3ee"; ctx.fillRect(-10, -10, 20, 20);
+    ctx.fillStyle = "#a5f3fc"; ctx.fillRect(-5, -5, 10, 10); ctx.restore();
+  }
+  // Players — square + health bar on top + name below.
+  const drawPlayer = (x, y, name, health, color, isMe) => {
+    const sx = x - camX, sy = y - camY;
+    if (sx < -40 || sy < -40 || sx > W + 40 || sy > H + 40) return;
+    const s = PLAYER_SIZE;
+    ctx.fillStyle = color; ctx.fillRect(sx - s / 2, sy - s / 2, s, s);
+    ctx.strokeStyle = isMe ? "#ffffff" : "#00000066"; ctx.lineWidth = isMe ? 3 : 1;
+    ctx.strokeRect(sx - s / 2, sy - s / 2, s, s);
+    // Health bar on top.
+    const bw = 36, bh = 6, bx = sx - bw / 2, by = sy - s / 2 - 12;
+    ctx.fillStyle = "#000000aa"; ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
+    ctx.fillStyle = "#222"; ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = health > 50 ? "#22c55e" : health > 25 ? "#eab308" : "#ef4444";
+    ctx.fillRect(bx, by, bw * Math.max(0, Math.min(1, health / 100)), bh);
+    // Name below.
+    ctx.fillStyle = "#fff"; ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(name, sx, sy + s / 2 + 16);
+  };
+  for (const [id, p] of players.entries()) {
+    if (id === clientId) continue;
+    drawPlayer(p.x, p.y, p.name, p.health, p.color, false);
+  }
+  drawPlayer(me.x, me.y, me.name + " (you)", me.health, me.color, true);
+  // Minimap-ish hint.
+  ctx.fillStyle = "#ffffffaa"; ctx.font = "12px system-ui, sans-serif"; ctx.textAlign = "left";
+  ctx.fillText(`World ${WORLD_W}x${WORLD_H} — camera follows you`, 10, 18);
+}
+$("joinBtn").onclick = join;
+$("leaveBtn").onclick = leave;
+$("spawnBtn").onclick = () => spawnGems(12);
+$("heartbeatBtn").onclick = sendHeartbeat;
+draw();
+</script>
+</body>
+</html>

@@ -222,6 +222,23 @@ class GameSessionConfig:
     # Opaque, game-specific rules. Validators / game adapters read them.
     custom_rules: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # --- Disconnection ---
+    # Seconds of silence before the server drops the client.
+    # The client game declares this per game_id on connect, e.g.
+    #   config: { game_id: "top-down-demo", disconnectionTime: 60 }
+    # Default 60. 0 == never expire.
+    #
+    # Enforcement is EVENT-DRIVEN, not a timer: there is no background
+    # loop / sleep. On every inbound packet from ANY client the server
+    # checks last_seen vs now for every client and evicts expired ones
+    # with reason="timeout". A packet is any client -> server HTTP
+    # request with X-Client-ID (join, character-state, item-state,
+    # claim/release, turn/action, custom-state, switch-environment,
+    # heartbeat, stream attach). If nobody sends a packet, an idle
+    # client stays listed until the next packet arrives. A late packet
+    # from an already-expired client is rejected (403) instead of
+    # reviving it.
+    disconnection_time_sec: float = 60.0
 
     def validate(self) -> None:
         if not self.game_id:
@@ -230,6 +247,14 @@ class GameSessionConfig:
             raise ValueError("need 1 <= min_players_per_room <= max_players_per_room <= 64")
         if self.requires_turn_based and self.max_players_per_room < 1:
             raise ValueError("turn-based rooms need max_players_per_room >= 1")
+        if self.disconnection_time_sec is None:
+            self.disconnection_time_sec = 60.0
+        try:
+            self.disconnection_time_sec = float(self.disconnection_time_sec)
+        except (TypeError, ValueError):
+            raise ValueError("config.disconnection_time_sec must be a number")
+        if not 0 <= self.disconnection_time_sec <= 86400:
+            raise ValueError("config.disconnection_time_sec must be in [0, 86400]")
         self.turn.validate()
         if self.requires_matchmaking:
             self.matchmaking.enabled = True
@@ -239,6 +264,9 @@ class GameSessionConfig:
 
         Skill, region, and game_mode are part of the bucket; skill *value*
         is not (that is the thing we match *on*, not *by*).
+        disconnection_time_sec is deliberately NOT part of the bucket:
+        enforcement is per-client, so two players with different budgets
+        can still match.
         """
         import json
 
@@ -264,6 +292,9 @@ class GameSessionConfig:
 
         Accepts the flat aliases clients actually send
         (``maxPlayersPerRoom``) as well as the nested shape.
+        Accepts ``disconnectionTime`` / ``disconnection_time_sec`` /
+        ``disconnection_time`` / ``disconnect_timeout_sec`` /
+        ``disconnectTimeout`` for the disconnect budget.
         """
         if payload is None:
             return cls()
@@ -292,6 +323,23 @@ class GameSessionConfig:
                              "turn_based", "turnBased", default=False)
         if isinstance(requires_turn, dict):
             requires_turn = requires_turn.get("enabled", False)
+
+        # Disconnection budget — top-level config field.
+        raw_disconnect = _pop(
+            "disconnection_time_sec", "disconnectionTime",
+            "disconnection_time", "disconnect_timeout_sec",
+            "disconnectTimeout", default=60.0,
+        )
+        # Also accept it nested under matchmaking for clients that put it there.
+        if isinstance(matchmaking_raw, dict) and raw_disconnect == 60.0:
+            for k in ("disconnection_time_sec", "disconnectionTime", "disconnection_time"):
+                if k in matchmaking_raw:
+                    raw_disconnect = matchmaking_raw.get(k)
+                    break
+        try:
+            disconnection_time_sec = float(raw_disconnect) if raw_disconnect is not None else 60.0
+        except (TypeError, ValueError):
+            disconnection_time_sec = 60.0
 
         # Authority may arrive as a bare list: authority: ["turns", "score"]
         if isinstance(authority_raw, list):
@@ -337,6 +385,7 @@ class GameSessionConfig:
             room_code=_pop("room_code", "roomCode", default=None),
             custom_rules=dict(_pop("custom_rules", "customRules", default={}) or {}),
             metadata=dict(_pop("metadata", default={}) or {}),
+            disconnection_time_sec=disconnection_time_sec,
         )
         if raw:  # unknown top-level keys: keep for forward-compat
             cfg.metadata.setdefault("unknown_config_keys", sorted(raw.keys()))
@@ -397,6 +446,8 @@ class JoinResponse:
     turn_order: List[str] = field(default_factory=list)
     skill_source: SkillSource = "client_reported"
     config: Optional[GameSessionConfig] = None
+    # Echo of the effective disconnect budget for this client.
+    disconnection_time_sec: float = 60.0
 
 
 @dataclass
@@ -414,6 +465,23 @@ class ClientLeftSignal:
     eventType: Literal["left"] = "left"
     clientId: str = ""
     totalClients: int = 0
+    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    reason: Optional[str] = None  # "leave" | "timeout" | "env_switch" | "disconnect"
+
+
+@dataclass
+class ClientDisconnectedSignal:
+    """Sent when the server evicts a client for silence.
+
+    Broadcast as client-left with reason="timeout", plus this shape
+    is available for clients that want an explicit disconnect event.
+    """
+
+    eventType: Literal["disconnected"] = "disconnected"
+    clientId: str = ""
+    reason: Literal["timeout"] = "timeout"
+    disconnection_time_sec: float = 60.0
+    last_seen_ms: int = 0
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
@@ -582,6 +650,7 @@ class CharacterState:
     facing: int = 1  # -1 left, 1 right
     score: int = 0
     onGround: bool = False
+    health: int = 100  # 0..100, rendered as health bar on top in top-down demo
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -611,6 +680,10 @@ class CharacterState:
             raise ValueError("facing must be -1 or 1")
         if "score" in values and (isinstance(values["score"], bool) or not isinstance(values["score"], int)):
             raise ValueError("score must be an integer")
+        if "health" in values:
+            h = values["health"]
+            if isinstance(h, bool) or not isinstance(h, int) or not 0 <= h <= 100:
+                raise ValueError("health must be an integer in [0, 100]")
         for name in ("isJumping", "onGround"):
             if name in values and not isinstance(values[name], bool):
                 raise ValueError(name + " must be a boolean")
@@ -649,6 +722,7 @@ class ItemInstanceState:
     isCollected: bool = False
     collectedByClientId: Optional[str] = None
     ownerClientId: Optional[str] = None
+    environment: Optional[str] = None  # env this item is bound to; set on first sight
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
@@ -758,11 +832,12 @@ class Capabilities:
         "envAuthority": True, "synchronizer": True,
         "matchmaking": True, "turnBased": True,
         "skillProviders": True, "rooms": True, "customGames": True,
+        "disconnectionTime": True, "heartbeat": True,
         "websocket": False, "sse": True,
     })
     # Defaults only — each room's GameSessionConfig overrides these.
     limits: Dict[str, int] = field(default_factory=lambda: {
         "maxClients": 16, "maxPlayersPerRoom": 8,
-        "maxSkillGap": 500,
+        "maxSkillGap": 500, "disconnectionTimeSec": 60,
     })
     skill_sources: List[str] = field(default_factory=lambda: ["client_reported"])
