@@ -35,7 +35,7 @@
   <label>DisconnectionTime (sec) <input id="disconnectSec" type="number" value="60" min="0" style="width:90px" /></label>
   <button id="joinBtn">Join</button>
   <button id="leaveBtn" disabled>Leave</button>
-  <button id="spawnBtn" disabled>Spawn gems (synchronizer)</button>
+  <button id="spawnBtn" disabled title="Server spawns gems">Gems: server-managed (24)</button>
   <button id="heartbeatBtn" disabled>Heartbeat</button>
 </div>
 <div id="status">Not joined.</div>
@@ -44,7 +44,7 @@
   <span id="hudPlayers">Players: 0</span>
   <span id="hudGems">Gems on map: 0</span>
   <span id="hudSync">Synchronizer: —</span>
-  <span id="hudDisconnect">Drop if silent: 60s</span>
+  <span id="hudDisconnect">Game data deleted if empty 5 min (on next packet) · Drop if silent: 60s</span>
 </div>
 <canvas id="game" width="800" height="600"></canvas>
 <p class="panel" style="font-size:.85rem">
@@ -63,6 +63,9 @@
 <script>
 // ---------------------------------------------------------------------------
 // Top-down demo — realtime, event-driven only. No timers.
+// Server-authoritative: the server spawns gems on first join, keeps 24
+// live, respawns 1 per collection, and deletes game data if empty 5 min
+// (lazily, on the next packet). Clients send character-state + collections only.
 // ---------------------------------------------------------------------------
 const WORLD_W = 2000, WORLD_H = 2000;
 const SPEED = 220; // px/sec
@@ -115,6 +118,7 @@ async function join() {
       // NEW: per-game disconnect budget. Server enforces it lazily on next packet.
       disconnectionTime: disconnectSec,
       disconnection_time_sec: disconnectSec,
+      empty_game_ttl_sec: 300, // delete game data if empty 5 min (lazy, on next packet)
       authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
     },
   })});
@@ -123,15 +127,17 @@ async function join() {
   clientId = data.client_id; sessionId = data.session_id; roomId = data.room_id || null;
   isSynchronizer = !!data.is_synchronizer;
   $("status").textContent = `Joined as ${name} · Room ${roomId || ""} · ${isSynchronizer ? "synchronizer" : "client"}`;
-  $("hudDisconnect").textContent = `Drop if silent: ${data.disconnection_time_sec ?? disconnectSec}s`;
+  $("hudDisconnect").textContent = `Game data deleted if empty 5 min (on next packet) · Drop if silent: ${data.disconnection_time_sec ?? disconnectSec}s`;
   $("joinBtn").disabled = true; $("leaveBtn").disabled = false;
-  $("spawnBtn").disabled = !isSynchronizer; $("heartbeatBtn").disabled = false;
+  $("spawnBtn").disabled = true; // server spawns gems, never the client
+  $("heartbeatBtn").disabled = false;
   $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you" : "other"}`;
   log("joined: " + JSON.stringify(data));
   players.set(clientId, { x: me.x, y: me.y, health: me.health, score: me.score, name: me.name, color: me.color });
   connectStream();
-  // Synchronizer spawns the initial gem field. Everyone else waits for item-state.
-  if (isSynchronizer && gems.size === 0) await spawnGems(24);
+  // Server spawns the gem field on first join. This client just renders
+  // what the server sends in the bootstrap + item-state broadcasts.
+  // No client-side spawn — that was the bug where only Billy saw gems.
   lastPacketMs = performance.now();
   lastFrameMs = performance.now();
   if (!rafId) rafId = requestAnimationFrame(tick);
@@ -147,28 +153,21 @@ async function leave() {
   $("spawnBtn").disabled = true; $("heartbeatBtn").disabled = true;
   draw();
 }
-// --- items: spawn + collect -------------------------------------------------
-// Spawn = item-state updates. instanceId is namespaced to the environment
-// so the server's _item_belongs_to_environment() accepts it. We always send
-// `environment` explicitly too — that is what binds a fresh item to this env.
+// --- items: collect only ----------------------------------------------------
+// The SERVER spawns gems. This function is kept only so old call sites
+// don't crash — it does NOT create gems locally and does NOT send
+// item-state updates. Sending updates was the bug: the spawner added
+// gems optimistically to its own map, the server dropped them (no
+// authority registered on join), and the second player saw 0 gems.
+// Now: server spawns 24 on first join, respawns 1 per collection, and
+// every client renders only what the server broadcasts / bootstraps.
 async function spawnGems(count) {
-  if (!clientId || !isSynchronizer) return;
-  const updates = [];
-  for (let i = 0; i < count; i++) {
-    gemCounter += 1;
-    const p = randomPos();
-    const id = `top-down-demo:gem-${gemCounter}`;
-    gems.set(id, { x: p.x, y: p.y, isCollected: false });
-    updates.push({ instanceId: id, itemName: "gem", pos: [p.x, p.y], rot: [0, 0, 0, 1], isCollected: false, environment: "top-down-demo" });
-  }
-  const res = await api("/api/multiplayer/item-state", { method: "PATCH", body: JSON.stringify({ updates, collections: [], timestamp: Date.now() }) });
-  log(`spawned ${count} gems -> ` + res.status);
-  lastPacketMs = performance.now();
+  log(`spawnGems(${count}) ignored — server owns gems (24 live, respawn on collect).`);
 }
 // Collect = item-state collections, NOT an update. The server accepts a
-// collection from any player (no ownership check on collections), marks the
-// item collected exactly once, and broadcasts it. Position updates still
-// require the env authority, so only the synchronizer moves/spawns gems.
+// collection from any player, marks the item collected exactly once,
+// spawns a replacement gem, and broadcasts collection + replacement
+// in the same packet. Clients never spawn or move gems.
 async function collectGem(instanceId) {
   if (pendingCollections.has(instanceId)) return;
   pendingCollections.add(instanceId);
@@ -226,9 +225,8 @@ function applyMp(mp) {
     if (typeof mp.connection.isSynchronizer === "boolean" && mp.connection.isSynchronizer !== isSynchronizer) {
       isSynchronizer = mp.connection.isSynchronizer;
       $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you (failover)" : "other"}`;
-      $("spawnBtn").disabled = !isSynchronizer;
-      // Failover: new synchronizer tops up the field if it went empty.
-      if (isSynchronizer && gems.size === 0) spawnGems(24);
+      $("spawnBtn").disabled = true; // server keeps gems across failover
+      // Failover: gems stay on the server, no client top-up needed.
     }
     if (mp.connection.roomId) roomId = mp.connection.roomId;
   }
@@ -258,9 +256,8 @@ function applyMp(mp) {
         const wasMine = coll.collectedByClientId === clientId;
         gems.delete(coll.instanceId); pendingCollections.delete(coll.instanceId);
         if (wasMine) { me.score += 1; $("hudScore").textContent = `Gems: ${me.score}`; sendCharacterState(true); }
-        // Synchronizer keeps the field populated: one new gem per collection.
-        // New instanceId each time, so we never need to un-collect an old row.
-        if (isSynchronizer) spawnGems(1);
+        // Server respawns 1 gem per collection in the same packet.
+        // No client top-up — server keeps the field at 24.
       }
     }
   }

@@ -283,6 +283,22 @@ class MultiplayerRegistry:
         self.rooms: Dict[str, Room] = {}
         self._lock = asyncio.Lock()
         self.running = True
+        # --- Empty-game cleanup (event-driven, no timer loop) ---
+        # env -> ms when it became empty (last client left / timed out).
+        # Deleted lazily on the next packet from ANY client once
+        # now - empty_since > ttl. See _sweep_empty_games_locked.
+        self.env_empty_since: Dict[str, int] = {}
+        # env -> TTL (sec) captured from the last client that was in it.
+        # Default 300s (5 min). Overridable per-game via config.
+        self.env_empty_ttl_sec: Dict[str, float] = {}
+        # --- Server-authoritative game data ---
+        # top-down-demo: server spawns gems, not the synchronizer client.
+        # Per-env gem counter so instanceIds never collide / get reused.
+        self._top_down_gem_counter: Dict[str, int] = {}
+        # How many live gems the server keeps on the field.
+        self.TOP_DOWN_GEM_TARGET = 24
+        # How long an empty game keeps its data before lazy deletion.
+        self.EMPTY_GAME_TTL_SEC = 300.0
 
     async def start(self):
         print("[SCS-MP-SYNC] Registry started")
@@ -290,6 +306,129 @@ class MultiplayerRegistry:
     async def stop(self):
         self.running = False
         print("[SCS-MP-SYNC] Registry stopped")
+
+    # -- server-authoritative game data + empty-game cleanup --------
+    # The server owns game data from the moment the FIRST player for a
+    # particular game connects. Clients never spawn authoritative state:
+    # they send character-state + collections, the server spawns / respawns
+    # items, keeps the field full, and hands the full snapshot to late
+    # joiners via _mp_for_client bootstrap. If the last client leaves,
+    # the game data is kept for EMPTY_GAME_TTL_SEC (5 min) so a quick
+    # reconnect resumes the same game, then deleted lazily on the next
+    # packet from ANY client. No background task, no sleep, no timer:
+    # deletion only happens because a packet arrived.
+    def _is_top_down_game(self, game_id: str = "", env_name: str = "") -> bool:
+        return game_id == "top-down-demo" or env_name == "top-down-demo"
+
+    def _delete_game_data_locked(self, env_name: str, now_ms: int) -> List[str]:
+        """Delete ALL stored data for one empty game (env). Caller holds lock."""
+        deleted: List[str] = []
+        # Items for this env.
+        for iid in [k for k, v in list(self.item_environments.items()) if v == env_name]:
+            deleted.append(iid)
+            self.item_environments.pop(iid, None)
+            self.item_cache.pop(iid, None)
+            try:
+                self.dirty_filter.cache.pop(iid, None)
+            except Exception:
+                pass
+            try:
+                if iid in getattr(self.authority, "itemOwners", {}):
+                    del self.authority.itemOwners[iid]
+            except Exception:
+                pass
+        # Any item_cache rows that carry environment==env but were never bound.
+        for iid in [k for k, v in list(self.item_cache.items())
+                    if isinstance(v, dict) and v.get("environment") == env_name]:
+            deleted.append(iid)
+            self.item_cache.pop(iid, None)
+            self.item_environments.pop(iid, None)
+            try:
+                self.dirty_filter.cache.pop(iid, None)
+            except Exception:
+                pass
+        # Characters for this env (should already be gone on leave).
+        for cid in [cid for cid, st in list(self.character_cache.items())
+                    if cid in self.clients and self.clients[cid].environment == env_name]:
+            self.character_cache.pop(cid, None)
+        # Rooms with no players that belong to this env.
+        for rid in [rid for rid, room in list(self.rooms.items())
+                    if not room.player_ids and (
+                        getattr(room, "_join_key", "") == f"direct:{env_name}"
+                        or getattr(room, "_join_key", "") == env_name
+                        or room.game_id == env_name)]:
+            self.rooms.pop(rid, None)
+        # Env authority / synchronizer pointers.
+        try:
+            if hasattr(self.authority, "envAuthority"):
+                self.authority.envAuthority.pop(env_name, None)
+        except Exception:
+            pass
+        self.synchronizers.pop(env_name, None)
+        self._top_down_gem_counter.pop(env_name, None)
+        self.env_empty_since.pop(env_name, None)
+        self.env_empty_ttl_sec.pop(env_name, None)
+        return list(dict.fromkeys(deleted))
+
+    def _sweep_empty_games_locked(self, now_ms: int) -> List[str]:
+        """Delete game data for envs empty longer than their TTL. Caller holds lock."""
+        deleted_envs: List[str] = []
+        for env_name, since in list(self.env_empty_since.items()):
+            # Still someone here? Should not happen, but be safe.
+            if any(c.environment == env_name for c in self.clients.values()):
+                self.env_empty_since.pop(env_name, None)
+                self.env_empty_ttl_sec.pop(env_name, None)
+                continue
+            ttl = self.env_empty_ttl_sec.get(env_name, self.EMPTY_GAME_TTL_SEC)
+            if ttl is None or ttl <= 0:
+                continue  # 0 == keep forever
+            if (now_ms - since) > ttl * 1000:
+                self._delete_game_data_locked(env_name, now_ms)
+                deleted_envs.append(env_name)
+        return deleted_envs
+
+    def _spawn_top_down_gems_locked(self, env_name: str, count: int, now_ms: int) -> List[Dict[str, Any]]:
+        """Server-spawn `count` gems for top-down-demo. Caller holds lock."""
+        import random as _random
+        out: List[Dict[str, Any]] = []
+        for _ in range(max(0, count)):
+            self._top_down_gem_counter[env_name] = self._top_down_gem_counter.get(env_name, 0) + 1
+            n = self._top_down_gem_counter[env_name]
+            iid = f"{env_name}:gem-{n}"
+            x = 80 + _random.random() * (2000 - 160)
+            y = 80 + _random.random() * (2000 - 160)
+            row: Dict[str, Any] = {
+                "instanceId": iid, "itemName": "gem",
+                "pos": [x, y], "rot": [0.0, 0.0, 0.0, 1.0],
+                "isCollected": False, "collectedByClientId": None,
+                "ownerClientId": None, "environment": env_name,
+                "timestamp": now_ms, "server_spawned": True,
+            }
+            self.item_cache[iid] = row
+            self.item_environments[iid] = env_name
+            try:
+                self.dirty_filter.cache[iid] = dict(row)
+            except Exception:
+                pass
+            out.append(dict(row))
+        return out
+
+    def _ensure_game_data_locked(self, env_name: str, game_id: str, now_ms: int) -> List[Dict[str, Any]]:
+        """Ensure server-owned data exists for a game. Caller holds lock.
+
+        top-down-demo: keep TOP_DOWN_GEM_TARGET live gems. Other games:
+        no-op today (their state is character + turn + custom, already
+        server-held). Called on first join, on env switch, and after
+        every collection (to top up).
+        """
+        if not self._is_top_down_game(game_id, env_name):
+            return []
+        live = sum(1 for v in self.item_cache.values()
+                   if isinstance(v, dict) and v.get("environment") == env_name
+                   and not v.get("isCollected"))
+        if live >= self.TOP_DOWN_GEM_TARGET:
+            return []
+        return self._spawn_top_down_gems_locked(env_name, self.TOP_DOWN_GEM_TARGET - live, now_ms)
 
     # -- disconnection: event-driven, no timers -------------------------
     def _is_expired(self, session: ClientSession, now_ms: int) -> bool:
@@ -315,6 +454,10 @@ class MultiplayerRegistry:
         ]
         for cid in expired:
             await self._remove_client_locked(cid, reason="timeout", now_ms=now_ms)
+        # Empty-game cleanup rides on the same packet. An env that just
+        # became empty has age 0, so it is NOT deleted here; it is only
+        # deleted once a LATER packet arrives after its TTL has passed.
+        self._sweep_empty_games_locked(now_ms)
         return expired
 
     async def _check_sender_alive_locked(self, client_id: str, now_ms: int) -> Optional[ClientSession]:
@@ -367,8 +510,27 @@ class MultiplayerRegistry:
                 last_seen_ms=now, disconnection_time_sec=config.disconnection_time_sec)
             self.clients[client_id] = session
             self.sessions[session_id] = client_id
+            # Game is no longer empty: cancel any pending empty-game deletion.
+            self.env_empty_since.pop(req.environment_name, None)
+            self.env_empty_ttl_sec.pop(req.environment_name, None)
             if is_sync:
                 self.synchronizers[req.environment_name] = client_id
+            # Register with the authority manager so get_resolved_owner()
+            # resolves to the first player. Previously join never called
+            # client_arrives (only switch_environment did), so the first
+            # player's item updates were silently dropped and only the
+            # spawner saw gems locally (optimistic local add).
+            try:
+                _auth_ev = self.authority.client_arrives(client_id, req.environment_name)
+            except Exception:
+                _auth_ev = {}
+            # Server owns game data from the FIRST join. Spawn it now so
+            # the joining client's bootstrap already contains the field.
+            # For top-down-demo this creates 24 gems; for other games no-op.
+            try:
+                self._ensure_game_data_locked(req.environment_name, req.game_id, now)
+            except Exception:
+                pass
             if config.requires_matchmaking:
                 session.match_status = "queued"
                 await self.matchmaker.enqueue(client_id, session_id, req, skill)
@@ -526,6 +688,27 @@ class MultiplayerRegistry:
                                                   "timestamp": now})
             if not room.player_ids:
                 self.rooms.pop(room.room_id, None)
+        # Character state for this client is gone with the client.
+        self.character_cache.pop(client_id, None)
+        # If this env is now empty, start the 5-minute grace clock.
+        # Data is NOT deleted here; it is deleted lazily by
+        # _sweep_empty_games_locked on the next packet after the TTL.
+        # A reconnect within 5 min resumes the same game.
+        _remaining = [c for c in self.clients.values() if c.environment == session.environment]
+        if not _remaining:
+            ttl = 300.0
+            try:
+                if session.config is not None:
+                    ttl = float(getattr(session.config, "empty_game_ttl_sec", 300.0) or 300.0)
+            except Exception:
+                ttl = 300.0
+            # Only start the clock if we actually have data worth keeping.
+            # If there is no data, deletion is a no-op anyway.
+            self.env_empty_since[session.environment] = now
+            self.env_empty_ttl_sec[session.environment] = ttl
+        else:
+            self.env_empty_since.pop(session.environment, None)
+            self.env_empty_ttl_sec.pop(session.environment, None)
         await self._broadcast_signal("client-left",
                                     {"eventType": "left", "clientId": client_id,
                                      "totalClients": sum(s.environment == session.environment
@@ -562,6 +745,18 @@ class MultiplayerRegistry:
             self.character_cache.pop(client_id, None)
             self.freshness.client_leaves(previous_environment, client_id)
             client.environment = environment
+            # New env is no longer empty; old env may have just become empty.
+            self.env_empty_since.pop(environment, None)
+            self.env_empty_ttl_sec.pop(environment, None)
+            _old_remaining = [c for c in self.clients.values() if c.environment == previous_environment]
+            if not _old_remaining:
+                self.env_empty_since[previous_environment] = _now_ms()
+                self.env_empty_ttl_sec[previous_environment] = 300.0
+            # Server owns data for the new env too: spawn if first in.
+            try:
+                self._ensure_game_data_locked(environment, client.game_id, _now_ms())
+            except Exception:
+                pass
             authority_event = self.authority.client_arrives(client_id, environment)
             self.freshness.client_enters(environment, client_id, list(self.item_cache))
             await self._broadcast_signal("client-left",
@@ -651,14 +846,16 @@ class MultiplayerRegistry:
                            "isSynchronizer": client.is_synchronizer, "environment": env_name,
                            "roomId": client.room_id, "gameId": client.game_id,
                            "matchStatus": client.match_status,
-                           "disconnectionTimeSec": client.disconnection_time_sec},
+                           "disconnectionTimeSec": client.disconnection_time_sec,
+                           "emptyGameTtlSec": self.env_empty_ttl_sec.get(env_name, 300.0)},
             "clients": [{"clientId": c.client_id, "character": c.character_name,
                          "environment": c.environment}
                         for c in self.clients.values() if c.environment == env_name],
             "characters": [st.to_dict() for oid, st in self.character_cache.items()
                            if oid in self.clients and self.clients[oid].environment == env_name],
             "items": {"updates": [row for row in self.item_cache.values()
-                                  if self._item_belongs_to_environment(row.get("instanceId", ""), env_name)],
+                                  if self._item_belongs_to_environment(row.get("instanceId", ""), env_name)
+                                  or row.get("environment") == env_name],
                       "collections": []},
         }
         if room:
@@ -847,7 +1044,27 @@ class MultiplayerRegistry:
                 # Authority-gated: rooms without items coverage relay nothing.
                 if not self._authority_covers(session, "items", "item"):
                     continue
+                # Server-authoritative gems: clients never move / spawn them.
+                # A top-down client that still tries to spawn gems (old demo)
+                # must be dropped, otherwise it would duplicate the
+                # server field. Only collections are accepted for gems.
+                _cached_pre = self.item_cache.get(iid)
+                if self._is_top_down_game(session.game_id, env_name):
+                    if (_cached_pre and _cached_pre.get("server_spawned")) or row.get("itemName") in ("gem", ""):
+                        continue
                 resolved = self.authority.get_resolved_owner(iid, env_name)
+                if resolved is None:
+                    # No owner yet (e.g. first creator). Synchronizer wins;
+                    # otherwise drop. This fixes the old bug where join
+                    # never registered authority so EVERY update was dropped.
+                    if session.is_synchronizer:
+                        try:
+                            self.authority.client_arrives(client_id, env_name)
+                        except Exception:
+                            pass
+                        resolved = client_id
+                    else:
+                        continue
                 if resolved != client_id:
                     continue  # silently drop per §7.5
                 cached = self.item_cache.get(iid)
@@ -901,6 +1118,11 @@ class MultiplayerRegistry:
                 self._bind_item_environment(iid, env_name)
                 # Keep the dirty cache in sync so a later update cannot resurrect it.
                 self.dirty_filter.cache[iid] = dict(self.item_cache[iid])
+                # Server keeps the top-down field full: one new gem per
+                # collection, included in the SAME broadcast as the collection.
+                if self._is_top_down_game(session.game_id, env_name):
+                    _respawned = self._spawn_top_down_gems_locked(env_name, 1, now)
+                    accepted_updates.extend(_respawned)
             if accepted_updates or accepted_collections:
                 await self._broadcast_signal("item-state-update",
                                             {"updates": accepted_updates, "collections": accepted_collections,
@@ -1510,6 +1732,8 @@ async def root():
             "tic_tac_toe_demo": "GET /tic-tac-toe -> demo client page (HTML, NOT an API)",
             "demo_generic": "GET /demo/{name} -> static demo client for any game",
             "top_down_demo": "GET /top-down -> top-down realtime demo (gems, squares, health bars)",
+            "server_authoritative": "First join spawns server game data; clients send character-state + collections only",
+            "empty_game_cleanup": "Game data deleted lazily on next packet after 5 min empty (no timer loop)",
             "top_down_demo_alias": "GET /demo/top-down -> same file",
         },
         "signals": ["mp"],

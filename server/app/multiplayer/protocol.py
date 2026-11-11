@@ -239,6 +239,11 @@ class GameSessionConfig:
     # from an already-expired client is rejected (403) instead of
     # reviving it.
     disconnection_time_sec: float = 60.0
+    # Seconds an empty game keeps its data before lazy deletion.
+    # Default 300 (5 min). 0 == keep forever. Deletion is event-driven:
+    # checked on the next packet from ANY client, never by a timer.
+    # A reconnect within the TTL resumes the same game (same gems).
+    empty_game_ttl_sec: float = 300.0
 
     def validate(self) -> None:
         if not self.game_id:
@@ -255,6 +260,14 @@ class GameSessionConfig:
             raise ValueError("config.disconnection_time_sec must be a number")
         if not 0 <= self.disconnection_time_sec <= 86400:
             raise ValueError("config.disconnection_time_sec must be in [0, 86400]")
+        if self.empty_game_ttl_sec is None:
+            self.empty_game_ttl_sec = 300.0
+        try:
+            self.empty_game_ttl_sec = float(self.empty_game_ttl_sec)
+        except (TypeError, ValueError):
+            raise ValueError("config.empty_game_ttl_sec must be a number")
+        if not 0 <= self.empty_game_ttl_sec <= 86400:
+            raise ValueError("config.empty_game_ttl_sec must be in [0, 86400]")
         self.turn.validate()
         if self.requires_matchmaking:
             self.matchmaking.enabled = True
@@ -340,6 +353,14 @@ class GameSessionConfig:
             disconnection_time_sec = float(raw_disconnect) if raw_disconnect is not None else 60.0
         except (TypeError, ValueError):
             disconnection_time_sec = 60.0
+        raw_empty_ttl = _pop(
+            "empty_game_ttl_sec", "emptyGameTtlSec",
+            "empty_game_ttl", "emptyGameTtl", default=300.0,
+        )
+        try:
+            empty_game_ttl_sec = float(raw_empty_ttl) if raw_empty_ttl is not None else 300.0
+        except (TypeError, ValueError):
+            empty_game_ttl_sec = 300.0
 
         # Authority may arrive as a bare list: authority: ["turns", "score"]
         if isinstance(authority_raw, list):
@@ -386,6 +407,7 @@ class GameSessionConfig:
             custom_rules=dict(_pop("custom_rules", "customRules", default={}) or {}),
             metadata=dict(_pop("metadata", default={}) or {}),
             disconnection_time_sec=disconnection_time_sec,
+            empty_game_ttl_sec=empty_game_ttl_sec,
         )
         if raw:  # unknown top-level keys: keep for forward-compat
             cfg.metadata.setdefault("unknown_config_keys", sorted(raw.keys()))
