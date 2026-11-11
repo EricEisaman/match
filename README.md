@@ -1048,5 +1048,5 @@ MIT — see `LICENSE`. Use it in your game, your jam, your class, your startup. 
 
 ---
 
-*Hero image: `docs/hero.png` (1280×320) — place the file at `docs/hero.png` in the repo root so the raw GitHub link at the top of this README resolves. The image is generic to the open-source MATCH project and does not reference any deployment.*
+
 
