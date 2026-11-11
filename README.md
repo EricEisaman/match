@@ -1,16 +1,16 @@
-[MATCH — Open-source multiplayer matchmaking](https://raw.githubusercontent.com/EricEisaman/match/main/docs/hero.png)
+![MATCH — Open-source multiplayer matchmaking](https://raw.githubusercontent.com/EricEisaman/match/main/docs/hero.png)
 
 # MATCH
 
-[[License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[[Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
-[[FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg)](https://fastapi.tiangolo.com/)
-[[Transport](https://img.shields.io/badge/Transport-REST%20%2B%20SSE-8A2BE2.svg)](#api-reference)
-[[Timeouts](https://img.shields.io/badge/Timeouts-Event--Driven%20%E2%80%94%20No%20Timers-00C853.svg)](#disconnect-time--disconnection_time_sec)
-[[Matchmaking](https://img.shields.io/badge/Matchmaking-Skill--Aware%20%2B%20Direct%20Rooms-FF6D00.svg)](#how-matching-works)
-[[Modes](https://img.shields.io/badge/Modes-Turn--Based%20%7C%20Realtime-2962FF.svg)](#turn-based-or-not--choosing-a-mode)
-[[PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen.svg)](https://github.com/EricEisaman/match/pulls)
-[[Stars](https://img.shields.io/github/stars/EricEisaman/match?style=social)](https://github.com/EricEisaman/match/stargazers)
+![[License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![[Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/downloads/)
+![[FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688.svg)](https://fastapi.tiangolo.com/)
+![[Transport](https://img.shields.io/badge/Transport-REST%20%2B%20SSE-8A2BE2.svg)](#api-reference)
+![[Timeouts](https://img.shields.io/badge/Timeouts-Event--Driven%20%E2%80%94%20No%20Timers-00C853.svg)](#disconnect-time--disconnection_time_sec)
+![[Matchmaking](https://img.shields.io/badge/Matchmaking-Skill--Aware%20%2B%20Direct%20Rooms-FF6D00.svg)](#how-matching-works)
+![[Modes](https://img.shields.io/badge/Modes-Turn--Based%20%7C%20Realtime-2962FF.svg)](#turn-based-or-not--choosing-a-mode)
+![[PRs Welcome](https://img.shields.io/badge/PRs-Welcome-brightgreen.svg)](https://github.com/EricEisaman/match/pulls)
+![[Stars](https://img.shields.io/github/stars/EricEisaman/match?style=social)](https://github.com/EricEisaman/match/stargazers)
 
 > **One join shape serves every game.**
 >
