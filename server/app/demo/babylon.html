@@ -137,7 +137,10 @@ const api = (path, opts = {}) => fetch(path, {
 });
 function colorFor(id) {
   let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return `hsl(${h % 360} 70% 55%)`;
+  const hue = (h % 360) / 360;
+  const f = (n) => { const k = (((n + hue) % 1) + 1) % 1; if (k < 1 / 6) return 0.55 + 0.45 * 6 * k; if (k < 1 / 2) return 1.0; if (k < 2 / 3) return 0.55 + 0.45 * (2 / 3 - k) * 6; return 0.55; };
+  const r = Math.round(255 * f(1 / 3)), g = Math.round(255 * f(0)), b = Math.round(255 * f(-1 / 3));
+  return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
 }
 // --- coordinate mapping: server 2000-space <-> Babylon 80-space -----------
 function to3D(x2d, y2d) { return { x: (x2d / WORLD_2D - 0.5) * WORLD_3D, z: (y2d / WORLD_2D - 0.5) * WORLD_3D }; }
@@ -460,7 +463,6 @@ async function join() {
     character_name: name,
     game_id: "babylon-demo",
     player_id: "demo-" + name.toLowerCase().replace(/\W+/g, "-") + "-" + Math.random().toString(36).slice(2, 6),
-    display_name: name,
     skill: { rating: skill },
     config: {
       game_id: "babylon-demo",
@@ -468,10 +470,8 @@ async function join() {
       requires_turn_based: false,
       max_players_per_room: 8,
       min_players_per_room: 1,
-      disconnectionTime: disconnectSec,
       disconnection_time_sec: disconnectSec,
       empty_game_ttl_sec: 300,
-      authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
     },
   })});
   const data = await res.json();
@@ -525,14 +525,21 @@ async function sendCharacterState(force) {
   const now = performance.now();
   if (!force && now - lastSentMs < 50) return;
   lastSentMs = now; lastPacketMs = now;
+  // Guard: never send a corrupt packet. JSON.stringify turns NaN/Infinity
+  // into null, and the server's from_payload rejects nulls with 422.
+  if (![me.x, me.y, me.yaw].every(Number.isFinite)) return;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, characterModelId: "HVGirl", position: [me.x, me.y], pos: [me.x, me.y],
-      velocity: [me.vx, me.vy], animationState: me.anim, animationFrame: 0, isJumping: false,
-      facing: me.yaw, score: me.score, health: me.health, onGround: true, timestamp: Date.now(),
-      metadata: { health: me.health, name: me.name, color: me.color } }],
+    updates: [{ clientId, pos: [me.x, me.y], facing: me.yaw,
+      animationState: me.anim, health: me.health, score: me.score,
+      metadata: { name: me.name, color: me.color } }],
     timestamp: Date.now(),
   })});
-  if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
+  if (!res.ok) {
+    // 422 body IS the validator's message — log it, don't swallow it.
+    const d = await res.json().catch(() => ({}));
+    log("character-state " + res.status + ": " + JSON.stringify(d));
+    if (res.status === 403) await leave();
+  }
 }
 function handleStreamData(raw) {
   try {
@@ -643,6 +650,7 @@ scene.onBeforeRenderObservable.add(() => {
 
   // Tank controls, Playground-style: A/D rotate, W/S move along facing.
   me.yaw += turn * ROT_SPEED * dt;
+  me.yaw = Math.atan2(Math.sin(me.yaw), Math.cos(me.yaw)); // [-PI, PI], same direction
   heroRoot.rotation.y = me.yaw;
   const speed = fwd > 0 ? SPEED_FWD : fwd < 0 ? -SPEED_BACK : 0;
   const dx3 = Math.sin(me.yaw) * speed * dt;
