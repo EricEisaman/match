@@ -236,10 +236,10 @@ ground.material = groundMaterial;
     if (rnd() > 0.5) {
       const trunk = BABYLON.MeshBuilder.CreateCylinder("trunk", { height: 1.6, diameter: 0.4 }, scene);
       trunk.position.set(x, 0.8, z); trunk.material = trunkMat;
-      const leaves = BABYLON.MeshBuilder.CreateCone("leaves", { height: 2.2, diameter: 1.8 }, scene);
+      const leaves = BABYLON.MeshBuilder.CreateCylinder("leaves", { height: 2.2, diameterTop: 0, diameterBottom: 1.8 }, scene);
       leaves.position.set(x, 2.6, z); leaves.material = leafMat;
     } else {
-      const rock = BABYLON.MeshBuilder.CreateIcoSphere("rock", { radius: 0.5 + rnd() * 0.5 }, scene);
+      const rock = BABYLON.MeshBuilder.CreateSphere("rock", { diameter: 1.0 + rnd() * 1.0 }, scene);
       rock.position.set(x, 0.35, z); rock.material = rockMat; rock.scaling.y = 0.7;
     }
   }
@@ -317,47 +317,25 @@ function createCharacterUI(mesh, characterName, maxHealth, isMe) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Hero — Playground HVGirl, parented to a TransformNode we actually move.
-// If the GLB fails (offline / blocked), fall back to a capsule so the
-// demo is still playable and the name/health bars still work.
+// No fallback. If HVGirl fails to load, it fails loudly in the log.
+// No capsule placeholder, no skib stand-in.
 // ---------------------------------------------------------------------------
 const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
 heroRoot.position.set(0, 0, 0);
 let heroMesh = null;          // mesh the UI links to (GLB root or capsule)
 let heroUI = null;
-let fallbackMesh = null;      // capsule shown while HVGirl loads; disposed on load
 let animGroups = {};          // Walking / WalkingBack / Idle / Samba
 let currentAnim = "";
 let heroLoaded = false;
 
-function makeFallbackHero() {
-  if (fallbackMesh) return fallbackMesh;
-  const cap = BABYLON.MeshBuilder.CreateCapsule("heroCapsule", { height: 1.8, radius: 0.42 }, scene);
-  cap.parent = heroRoot; cap.position.y = 0.9;
-  const mat = new BABYLON.StandardMaterial("heroMat", scene);
-  mat.diffuseColor = BABYLON.Color3.FromHexString("#4da3ff");
-  mat.emissiveColor = new BABYLON.Color3(0.05, 0.1, 0.2);
-  cap.material = mat;
-  const head = BABYLON.MeshBuilder.CreateSphere("heroHead", { diameter: 0.55 }, scene);
-  head.parent = heroRoot; head.position.y = 2.05; head.material = mat;
-  fallbackMesh = cap;
-  return cap;
-}
 function ensureHeroUI() {
   if (heroUI || !heroMesh) return;
   heroUI = createCharacterUI(heroMesh, me.name + " (you)", me.health, true);
 }
 BABYLON.SceneLoader.ImportMesh("", "https://assets.babylonjs.com/meshes/", "HVGirl.glb", scene,
   function (newMeshes, _ps, _skeletons, animationGroups) {
-    // If a fallback capsule was shown while loading, remove it + its UI
-    // so we don't end up with two heroes / two name bars.
-    if (fallbackMesh) {
-      try { if (heroUI) heroUI.dispose(); } catch (e) {}
-      heroUI = null;
-      try { fallbackMesh.dispose(); } catch (e) {}
-      try { scene.getMeshByName("heroHead")?.dispose(); } catch (e) {}
-      fallbackMesh = null;
-    }
     heroMesh = newMeshes[0];
     heroMesh.parent = heroRoot;
     heroMesh.scaling.scaleInPlace(0.1);
@@ -370,13 +348,9 @@ BABYLON.SceneLoader.ImportMesh("", "https://assets.babylonjs.com/meshes/", "HVGi
   },
   null,
   function (_scene, msg) {
-    log("HVGirl failed to load (" + msg + ") — using capsule fallback.");
-    if (!heroMesh) { heroMesh = makeFallbackHero(); ensureHeroUI(); }
+    log("HVGirl failed to load (" + msg + ") — no fallback, hero stays missing.");
   }
 );
-// If the GLB is slow, show a capsule immediately so the scene is not empty;
-// it is removed once HVGirl arrives.
-setTimeout(() => { if (!heroLoaded && !heroMesh) { heroMesh = makeFallbackHero(); ensureHeroUI(); } }, 2500);
 
 function playAnim(name) {
   if (currentAnim === name) return;
@@ -393,7 +367,7 @@ function animForInput() {
   return "Idle";
 }
 
-// --- keyboard: Playground ActionManager + window fallback for arrows ------
+// --- keyboard: Playground ActionManager + window key handling for arrows ------
 const inputMap = {};
 scene.actionManager = new BABYLON.ActionManager(scene);
 scene.actionManager.registerAction(new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyDownTrigger, (evt) => {
