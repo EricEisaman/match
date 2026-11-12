@@ -1,0 +1,800 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Babylon.js — Realtime Demo</title>
+<!--
+  babylon.html — realtime multiplayer demo for MATCH
+  Put this file in server/app/demo/babylon.html, with hulk.glb in the
+  SAME directory: server/app/demo/hulk.glb. Serve at /demo/babylon or /babylon.
+
+  WHAT IT IS
+  - Babylon.js 3D version of top-down.html. Same MATCH protocol, same API:
+    join -> stream (SSE) -> character-state / item-state / heartbeat -> leave.
+  - Local hero is hulk.glb, loaded relatively as "hulk.glb" (no CDN).
+    Animations in hulk.glb: idle, jump, run (matched case-insensitively).
+    NO FALLBACK for the hero: if hulk.glb fails, heroMesh stays null,
+    the error is logged, no capsule stand-in is created.
+  - Remote peers are CLONES of hulk.glb, not capsules. For each remote
+    clientId we call SceneLoader.ImportMesh("", "", "hulk.glb") again —
+    each import creates its own skeleton + AnimationGroups, so each remote
+    can play idle / jump / run independently. That is the clone. The browser
+    caches hulk.glb, so re-importing is cheap. While a remote clone is
+    loading its root exists but is empty; on failure it stays empty (no capsule).
+  - Name bar + health bar: Babylon.GUI panels linked to each character mesh.
+    Health is demo-only relayed state: the server broadcasts it, it does
+    not simulate combat.
+  - Game state arrives ONLY via SSE signal patches, never by polling:
+    GET /api/multiplayer/stream?session_id=... sends
+      event: datastar-patch-signals
+      data: signals {"mp": {...}}
+    handleStreamData() strips the "signals " prefix, JSON-parses it, and
+    applyMp() applies mp.connection / mp.characters / mp.items /
+    mp.clientJoined / mp.clientLeft / mp.synchronizer. See main.py
+    _broadcast_locked() for the server side that emits those patches.
+    The server also sends a full snapshot (all characters + all gems) as
+    the first patch when a client subscribes.
+
+  COORDINATES — READ THIS
+  - The server speaks one 2D space: 2000 x 2000 (top-down.html's WORLD_W/H).
+    character-state `position` and gem `pos` are [x, y] in that space.
+  - This demo maps that space onto an 80 x 80 Babylon ground:
+        x3d = (x2d / 2000 - 0.5) * 80
+        z3d = (y2d / 2000 - 0.5) * 80
+    We SEND 2000-space coords and CONVERT inbound coords, so a Babylon
+    client and a top-down client in the same environment would agree.
+  - main.py treats babylon-demo as a gem game, like top-down-demo:
+    server spawns 24 gems on first join, respawns 1 per collection.
+    The client never spawns gems locally.
+
+  NO TIMERS: movement is keydown/keyup + engine render loop,
+  disconnect is enforced lazily by the server on the next packet.
+-->
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; max-width: 860px; margin: 1.5rem auto; padding: 0 1rem; background: #121214; color: #e8e8e8; }
+  .panel { background: #1e2230; border: 1px solid #2f3a5a; color: #d6e0ff; padding: .75rem 1rem; border-radius: 8px; font-size: .9rem; }
+  .panel code { background: #121214; color: #e8e8e8; padding: 0 .25rem; border-radius: 4px; }
+  #renderCanvas { display: block; width: 100%; max-width: 800px; height: 600px; background: #0f1410; border: 1px solid #444; border-radius: 8px; margin: 1rem 0; touch-action: none; }
+  #status { font-weight: 600; margin: .5rem 0; }
+  #hud { display: flex; gap: 1rem; flex-wrap: wrap; font-size: .9rem; color: #d6e0ff; }
+  #log { white-space: pre-wrap; background: #0a0a0a; color: #d6ffd6; padding: .75rem; border-radius: 8px; font-size: .8rem; max-height: 220px; overflow: auto; }
+  input, button { padding: .5rem .75rem; font-size: 1rem; margin: .25rem 0; background: #1e1e22; color: #e8e8e8; border: 1px solid #444; border-radius: 6px; }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  kbd { background: #1e1e22; border: 1px solid #555; border-radius: 4px; padding: 0 .3rem; }
+</style>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+<script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+</head>
+<body>
+<h1>Babylon.js — Realtime Demo</h1>
+<p class="panel">
+  3D version of the top-down demo. Move with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys
+  (tank controls: <kbd>W</kbd>/<kbd>S</kbd> forward/back, <kbd>A</kbd>/<kbd>D</kbd> turn),
+  <kbd>Space</kbd> to jump, orbit with the mouse. Walk over a <code>gem</code> to collect it.
+  Gems are <code>item-state</code> — <code>updates</code> spawn them, <code>collections</code> collect them.
+  Every player gets a floating <b>name bar + health bar</b> above their head.
+  Hero + every remote peer are <code>hulk.glb</code> (<code>idle</code> / <code>jump</code> / <code>run</code>).
+  Game state arrives only via SSE <code>datastar-patch-signals</code> patches — no polling.
+  No timers anywhere: movement is <code>keydown</code>/<code>keyup</code> + render loop,
+  disconnect is enforced by the server on the next packet.
+</p>
+<div>
+  <label>Name <input id="name" value="player" /></label>
+  <label>Skill <input id="skill" type="number" value="1000" style="width:90px" /></label>
+  <label>DisconnectionTime (sec) <input id="disconnectSec" type="number" value="60" min="0" style="width:90px" /></label>
+  <button id="joinBtn">Join</button>
+  <button id="leaveBtn" disabled>Leave</button>
+  <button id="spawnBtn" disabled title="Server spawns gems">Gems: server-managed (24)</button>
+  <button id="heartbeatBtn" disabled>Heartbeat</button>
+</div>
+<div>
+  <button id="jumpBtn" disabled title="Space also works">🦘 Jump (Space)</button>
+  <button id="damageBtn" disabled title="Demo only — broadcasts lower health">−10 HP</button>
+  <button id="healBtn" disabled title="Demo only — broadcasts higher health">+10 HP</button>
+  <button id="resetHpBtn" disabled>Reset HP</button>
+</div>
+<div id="status">Not joined.</div>
+<div id="hud">
+  <span id="hudScore">Gems: 0</span>
+  <span id="hudPlayers">Players: 0</span>
+  <span id="hudGems">Gems on map: 0</span>
+  <span id="hudHealth">HP: 100</span>
+  <span id="hudSync">Synchronizer: —</span>
+  <span id="hudDisconnect">Game data deleted if empty 5 min (on next packet) · Drop if silent: 60s</span>
+</div>
+<canvas id="renderCanvas"></canvas>
+<p class="panel" style="font-size:.85rem">
+  <b>Disconnect rule:</b> the server stores <code>last_seen</code> per client and
+  <code>disconnectionTime</code> from your <code>config</code> (default 60s).
+  On <i>every</i> inbound packet from <i>any</i> client it sweeps expired clients
+  and evicts them with <code>reason: "timeout"</code>. There is no timer loop.
+  If nobody sends a packet, an idle client stays listed until the next packet
+  arrives. Your own late packet is rejected (<code>403 disconnected: timeout</code>)
+  instead of reviving you. Keep-alive is just another packet: this demo sends
+  <code>character-state</code> while moving and <code>/heartbeat</code> from the
+  render loop when idle.
+</p>
+<h3>Log</h3>
+<pre id="log"></pre>
+<script>
+// ---------------------------------------------------------------------------
+// Babylon demo — realtime, event-driven only. No timers.
+// Same MATCH API as top-down.html. Server-authoritative gems.
+// ---------------------------------------------------------------------------
+const WORLD_2D = 2000;          // server coordinate space (shared with top-down)
+const WORLD_3D = 80;            // Babylon ground size
+const SPEED_FWD = 7;            // units/sec (3D)
+const SPEED_BACK = 2.5;
+const ROT_SPEED = 2.4;          // rad/sec
+const GEM_COLLECT_DIST = 1.25;  // 3D units ~= 28px in top-down space
+const GEM_Y = 0.7;
+const JUMP_VEL = 8.5;           // initial upward velocity (units/sec)
+const GRAVITY = 22;             // downward accel (units/sec^2)
+const HERO_TARGET_HEIGHT = 1.9; // hulk.glb is auto-scaled to this height
+
+let clientId = null, sessionId = null, roomId = null;
+let isSynchronizer = false;
+let stream = null;
+let keys = new Set();
+let lastSentMs = 0, lastPacketMs = 0;
+let joined = false;
+
+const me = { x: WORLD_2D / 2, y: WORLD_2D / 2, vx: 0, vy: 0, health: 100, score: 0, name: "player", color: "#4da3ff", yaw: 0, anim: "idle", isJumping: false, onGround: true };
+const players = new Map(); // clientId -> {x2d,y2d,health,score,name,color,yaw,anim,y3d,root,mesh,animGroups,currentAnim,ui,loading}
+const gems = new Map();    // instanceId -> {x2d,y2d,mesh}
+const pendingCollections = new Set();
+
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $("log").textContent += msg + "\n"; $("log").scrollTop = 1e9; };
+const api = (path, opts = {}) => fetch(path, {
+  ...opts,
+  headers: { "Content-Type": "application/json", ...(clientId ? { "X-Client-ID": clientId } : {}), ...(opts.headers || {}) },
+});
+function colorFor(id) {
+  let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return `hsl(${h % 360} 70% 55%)`;
+}
+// --- coordinate mapping: server 2000-space <-> Babylon 80-space -----------
+function to3D(x2d, y2d) { return { x: (x2d / WORLD_2D - 0.5) * WORLD_3D, z: (y2d / WORLD_2D - 0.5) * WORLD_3D }; }
+function to2D(x3d, z3d) { return { x: (x3d / WORLD_3D + 0.5) * WORLD_2D, y: (z3d / WORLD_3D + 0.5) * WORLD_2D }; }
+// Inbound pos may be [x2d,y2d] (server / top-down) or [x3d,z3d] (a 3D client
+// sending raw Babylon coords). Heuristic: 3D coords live in -40..40,
+// 2D coords live in 0..2000 (gems spawn 80..1920, players near 1000).
+function normalizePos(pos) {
+  if (!Array.isArray(pos) || pos.length < 2) return { x2d: WORLD_2D / 2, y2d: WORLD_2D / 2 };
+  const [a, b] = pos;
+  if (a >= -WORLD_3D / 2 && a <= WORLD_3D / 2 && b >= -WORLD_3D / 2 && b <= WORLD_3D / 2) {
+    const c = to2D(a, b); return { x2d: c.x, y2d: c.y };
+  }
+  return { x2d: a, y2d: b };
+}
+
+// ---------------------------------------------------------------------------
+// Babylon scene — hulk.glb hero + ArcRotateCamera
+// ---------------------------------------------------------------------------
+const canvas = $("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true);
+engine.enableOfflineSupport = false;
+const scene = new BABYLON.Scene(engine);
+scene.clearColor = new BABYLON.Color4(0.06, 0.08, 0.06, 1);
+
+// Camera — Playground values, target follows the hero root.
+const camera1 = new BABYLON.ArcRotateCamera("camera1", Math.PI / 2, Math.PI / 4, 10, new BABYLON.Vector3(0, 1, 0), scene);
+scene.activeCamera = camera1;
+scene.activeCamera.attachControl(canvas, true);
+camera1.lowerRadiusLimit = 2;
+camera1.upperRadiusLimit = 18;
+camera1.wheelDeltaPercentage = 0.01;
+
+// Lights — Playground values.
+const light = new BABYLON.HemisphericLight("light1", new BABYLON.Vector3(0, 1, 0), scene);
+light.intensity = 0.6;
+light.specular = BABYLON.Color3.Black();
+const light2 = new BABYLON.DirectionalLight("dir01", new BABYLON.Vector3(0, -0.5, -1.0), scene);
+light2.position = new BABYLON.Vector3(0, 5, 5);
+
+// Skybox — Playground used local textures/skybox2; use the hosted equivalent
+// so the single file works without a textures/ folder. Falls back to clearColor.
+try {
+  const skybox = BABYLON.MeshBuilder.CreateBox("skyBox", { size: 1000 }, scene);
+  const skyboxMaterial = new BABYLON.StandardMaterial("skyBox", scene);
+  skyboxMaterial.backFaceCulling = false;
+  skyboxMaterial.reflectionTexture = new BABYLON.CubeTexture("https://assets.babylonjs.com/textures/skybox2", scene);
+  skyboxMaterial.reflectionTexture.coordinatesMode = BABYLON.Texture.SKYBOX_MODE;
+  skyboxMaterial.diffuseColor = BABYLON.Color3.Black();
+  skyboxMaterial.specularColor = BABYLON.Color3.Black();
+  skybox.material = skyboxMaterial;
+} catch (e) { /* skybox is decorative */ }
+
+// Ground — Playground used textures/wood.jpg on a 50x50 ground; here 80x80
+// to match WORLD_3D, with a hosted wood texture + grid lines for readability.
+const ground = BABYLON.MeshBuilder.CreateGround("ground", { height: WORLD_3D, width: WORLD_3D, subdivisions: 4 }, scene);
+const groundMaterial = new BABYLON.StandardMaterial("groundMaterial", scene);
+try {
+  groundMaterial.diffuseTexture = new BABYLON.Texture("https://assets.babylonjs.com/textures/wood.jpg", scene);
+  groundMaterial.diffuseTexture.uScale = 20;
+  groundMaterial.diffuseTexture.vScale = 20;
+} catch (e) { groundMaterial.diffuseColor = new BABYLON.Color3(0.25, 0.32, 0.22); }
+groundMaterial.specularColor = new BABYLON.Color3(.1, .1, .1);
+ground.material = groundMaterial;
+
+// Grid lines — make movement / scrolling visible, like the 2D grid.
+(function addGrid() {
+  const pts = [];
+  for (let i = -WORLD_3D / 2; i <= WORLD_3D / 2; i += 10) {
+    pts.push([new BABYLON.Vector3(i, 0.02, -WORLD_3D / 2), new BABYLON.Vector3(i, 0.02, WORLD_3D / 2)]);
+    pts.push([new BABYLON.Vector3(-WORLD_3D / 2, 0.02, i), new BABYLON.Vector3(WORLD_3D / 2, 0.02, i)]);
+  }
+  const grid = BABYLON.MeshBuilder.CreateLineSystem("grid", { lines: pts }, scene);
+  grid.color = new BABYLON.Color3(0.15, 0.25, 0.15);
+})();
+
+// World border + a few decorative low-poly trees/rocks (no collision).
+(function addDecor() {
+  const borderMat = new BABYLON.StandardMaterial("border", scene);
+  borderMat.diffuseColor = new BABYLON.Color3(0.23, 0.29, 0.23);
+  borderMat.emissiveColor = new BABYLON.Color3(0.08, 0.1, 0.08);
+  const mkWall = (w, d, x, z) => {
+    const m = BABYLON.MeshBuilder.CreateBox("wall", { width: w, height: 0.6, depth: d }, scene);
+    m.position.set(x, 0.3, z); m.material = borderMat;
+  };
+  const H = WORLD_3D / 2;
+  mkWall(WORLD_3D + 1, 0.6, 0, -H); mkWall(WORLD_3D + 1, 0.6, 0, H);
+  mkWall(0.6, WORLD_3D + 1, -H, 0); mkWall(0.6, WORLD_3D + 1, H, 0);
+  const trunkMat = new BABYLON.StandardMaterial("trunk", scene); trunkMat.diffuseColor = new BABYLON.Color3(0.4, 0.28, 0.15);
+  const leafMat = new BABYLON.StandardMaterial("leaf", scene); leafMat.diffuseColor = new BABYLON.Color3(0.15, 0.45, 0.2);
+  const rockMat = new BABYLON.StandardMaterial("rock", scene); rockMat.diffuseColor = new BABYLON.Color3(0.45, 0.45, 0.48);
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 14; i++) {
+    const x = (rnd() - 0.5) * (WORLD_3D - 12), z = (rnd() - 0.5) * (WORLD_3D - 12);
+    if (Math.hypot(x, z) < 4) continue;
+    if (rnd() > 0.5) {
+      const trunk = BABYLON.MeshBuilder.CreateCylinder("trunk", { height: 1.6, diameter: 0.4 }, scene);
+      trunk.position.set(x, 0.8, z); trunk.material = trunkMat;
+      const leaves = BABYLON.MeshBuilder.CreateCone("leaves", { height: 2.2, diameter: 1.8 }, scene);
+      leaves.position.set(x, 2.6, z); leaves.material = leafMat;
+    } else {
+      const rock = BABYLON.MeshBuilder.CreateIcoSphere("rock", { radius: 0.5 + rnd() * 0.5 }, scene);
+      rock.position.set(x, 0.35, z); rock.material = rockMat; rock.scaling.y = 0.7;
+    }
+  }
+})();
+
+// --- GUI: fullscreen UI + instructions (Playground pattern) ---------------
+const advancedTexture = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("UI");
+const instructions = new BABYLON.GUI.TextBlock();
+instructions.text = "Move w/ WASD keys, Space to Jump, look with the mouse";
+instructions.color = "white";
+instructions.fontSize = 16;
+instructions.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+instructions.textVerticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+advancedTexture.addControl(instructions);
+
+// ---------------------------------------------------------------------------
+// Name bar + health bar — adapted from the community concept in the prompt.
+// One linked StackPanel per character: name on top, health bar below.
+// The panel is linked to the character mesh so it tracks in 3D and
+// always faces the camera. Call ui.setHealth(h) / ui.setName(n) to update.
+// ---------------------------------------------------------------------------
+function healthColor(h) { return h > 50 ? "limegreen" : h > 25 ? "gold" : "red"; }
+function createCharacterUI(mesh, characterName, maxHealth, isMe) {
+  const panel = new BABYLON.GUI.StackPanel(`${mesh.id}_uiPanel`);
+  panel.widthInPixels = 110;
+  panel.heightInPixels = 38;
+  panel.isVertical = true;
+  panel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+  panel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+
+  const nameText = new BABYLON.GUI.TextBlock(`${mesh.id}_name`);
+  nameText.text = characterName;
+  nameText.color = isMe ? "#ffffff" : "white";
+  nameText.fontSize = 13;
+  nameText.fontWeight = isMe ? "bold" : "normal";
+  nameText.heightInPixels = 16;
+  nameText.outlineWidth = 3;
+  nameText.outlineColor = "black";
+  nameText.shadowColor = "black";
+  nameText.shadowBlur = 4;
+  panel.addControl(nameText);
+
+  const healthBg = new BABYLON.GUI.Rectangle(`${mesh.id}_healthBg`);
+  healthBg.widthInPixels = 88;
+  healthBg.heightInPixels = 9;
+  healthBg.color = "black";
+  healthBg.background = "#222222";
+  healthBg.thickness = 1;
+  healthBg.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+
+  const healthBar = new BABYLON.GUI.Rectangle(`${mesh.id}_healthBar`);
+  healthBar.width = "100%";
+  healthBar.height = "100%";
+  healthBar.color = "transparent";
+  healthBar.thickness = 0;
+  healthBar.background = healthColor(maxHealth);
+  healthBar.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+  healthBg.addControl(healthBar);
+
+  panel.addControl(healthBg);
+  advancedTexture.addControl(panel);
+  panel.linkWithMesh(mesh);
+  panel.linkOffsetYInPixels = -110;
+
+  return {
+    panel, nameText, healthBar, healthBg,
+    setName(n) { nameText.text = n; },
+    setHealth(h) {
+      const pct = Math.max(0, Math.min(100, h));
+      healthBar.width = pct + "%";
+      healthBar.background = healthColor(pct);
+    },
+    dispose() { advancedTexture.removeControl(panel); panel.dispose(); }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Hero — hulk.glb in the SAME directory as babylon.html. NO FALLBACK.
+// Remote peers are clones: see cloneRemoteHulk() below.
+// ---------------------------------------------------------------------------
+const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
+heroRoot.position.set(0, 0, 0);
+let heroMesh = null;          // null until hulk.glb loads; stays null on failure
+let heroUI = null;
+let animGroups = {};          // lower-cased: idle / jump / run
+let currentAnim = "";
+let heroLoaded = false;
+let jumpVel = 0;
+let spaceHeldPrev = false;
+
+function ensureHeroUI() {
+  if (heroUI || !heroMesh) return;
+  heroUI = createCharacterUI(heroMesh, me.name + " (you)", me.health, true);
+}
+// Shared scaling: we don't know hulk.glb's authored units, so normalize
+// hierarchy height to HERO_TARGET_HEIGHT (~1.9m) and re-ground feet to y=0.
+function scaleHulkMesh(mesh) {
+  try {
+    const bounds = mesh.getHierarchyBoundingVectors(true);
+    const h = bounds.max.y - bounds.min.y;
+    if (h > 0.001) {
+      mesh.scaling.scaleInPlace(HERO_TARGET_HEIGHT / h);
+      const b2 = mesh.getHierarchyBoundingVectors(true);
+      mesh.position.y = -b2.min.y;
+    }
+  } catch (e) { /* keep authored scale */ }
+}
+// Relative load: "hulk.glb" resolves against the page URL.
+// /demo/babylon -> /demo/hulk.glb, /babylon -> /hulk.glb
+BABYLON.SceneLoader.ImportMesh("", "", "hulk.glb", scene,
+  function (newMeshes, _ps, _skeletons, animationGroups) {
+    heroMesh = newMeshes[0];
+    heroMesh.parent = heroRoot;
+    heroMesh.position.set(0, 0, 0);
+    scaleHulkMesh(heroMesh);
+    heroLoaded = true;
+    for (const g of animationGroups) animGroups[String(g.name).toLowerCase()] = g;
+    playAnim("idle");
+    ensureHeroUI();
+    log("hulk.glb loaded: " + Object.keys(animGroups).join(", "));
+    if (!animGroups.idle || !animGroups.jump || !animGroups.run) {
+      log("WARNING: expected animations idle, jump, run — got: " + Object.keys(animGroups).join(", "));
+    }
+  },
+  null,
+  function (_scene, msg) {
+    // NO FALLBACK: do not create a capsule. Hero stays invisible.
+    log("hulk.glb failed to load (" + msg + ") — expected hulk.glb next to babylon.html in server/app/demo/. No fallback hero created.");
+  }
+);
+
+function playAnim(name) {
+  const key = String(name).toLowerCase();
+  if (currentAnim === key) return;
+  const g = animGroups[key];
+  if (!g) { currentAnim = key; return; }
+  for (const k of Object.keys(animGroups)) { if (k !== key) animGroups[k].stop(); }
+  g.start(true, 1.0, g.from, g.to, false);
+  currentAnim = key;
+}
+function tryJump() {
+  if (!me.onGround) return;
+  me.onGround = false; me.isJumping = true; jumpVel = JUMP_VEL;
+  playAnim("jump");
+  sendCharacterState(true);
+}
+function animForInput() {
+  if (!me.onGround) return "jump";
+  if (keys.has("w") || keys.has("s") || keys.has("a") || keys.has("d") ||
+      keys.has("arrowup") || keys.has("arrowdown") || keys.has("arrowleft") || keys.has("arrowright")) return "run";
+  return "idle";
+}
+
+// --- keyboard: Playground ActionManager + window fallback for arrows ------
+const inputMap = {};
+scene.actionManager = new BABYLON.ActionManager(scene);
+scene.actionManager.registerAction(new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyDownTrigger, (evt) => {
+  const k = evt.sourceEvent.key.toLowerCase(); inputMap[k] = true; keys.add(k);
+}));
+scene.actionManager.registerAction(new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyUpTrigger, (evt) => {
+  const k = evt.sourceEvent.key.toLowerCase(); inputMap[k] = false; keys.delete(k);
+}));
+addEventListener("keydown", (e) => {
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+  keys.add(e.key.toLowerCase());
+});
+addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+
+// --- remote players: CLONES of hulk.glb, one per clientId ----------------
+// THIS IS THE CLONE. For every remote clientId we re-import the SAME
+// hulk.glb file. Each ImportMesh call creates a NEW skeleton + NEW
+// AnimationGroups, so each remote can play idle / jump / run independently.
+// The browser caches hulk.glb, so re-importing is cheap. No capsule, no
+// shared skeleton, no shared AnimationGroups. While a clone is loading its
+// root exists but is empty; on failure it stays empty (no fallback).
+// Game state for remotes arrives ONLY via SSE signal patches (applyMp
+// below): mp.characters[] -> upsertRemote() -> clone + position + anim.
+function playRemoteAnim(p, name) {
+  const key = String(name || "idle").toLowerCase();
+  if (p.currentAnim === key) return;
+  p.currentAnim = key;
+  const g = p.animGroups ? p.animGroups[key] : null;
+  if (!g) return;
+  for (const k of Object.keys(p.animGroups)) { if (k !== key) p.animGroups[k].stop(); }
+  g.start(true, 1.0, g.from, g.to, false);
+}
+function cloneRemoteHulk(id, data) {
+  const root = new BABYLON.TransformNode("player_" + id, scene);
+  const p = { x2d: WORLD_2D / 2, y2d: WORLD_2D / 2, health: 100, score: 0,
+    name: data.name || "player", color: data.color || colorFor(id),
+    yaw: 0, anim: "idle", currentAnim: "", y3d: 0,
+    root, mesh: null, animGroups: {}, ui: null, loading: true, disposed: false };
+  players.set(id, p);
+  // Clone = fresh ImportMesh of hulk.glb. NOT mesh.clone(), NOT a capsule.
+  // mesh.clone() does NOT clone a skinned skeleton correctly; a fresh
+  // ImportMesh gives this remote its own skeleton + animation groups.
+  BABYLON.SceneLoader.ImportMesh("", "", "hulk.glb", scene,
+    function (newMeshes, _ps, _skeletons, animationGroups) {
+      if (p.disposed || players.get(id) !== p) {
+        for (const m of newMeshes) { try { m.dispose(); } catch (e) {} }
+        return;
+      }
+      const mesh = newMeshes[0];
+      mesh.parent = root;
+      mesh.position.set(0, 0, 0);
+      scaleHulkMesh(mesh);
+      p.mesh = mesh;
+      p.loading = false;
+      for (const g of animationGroups) p.animGroups[String(g.name).toLowerCase()] = g;
+      p.ui = createCharacterUI(mesh, p.name, 100, false);
+      p.ui.setHealth(p.health);
+      p.ui.setName(p.name);
+      playRemoteAnim(p, p.anim);
+      log("remote clone loaded: " + id + " (" + p.name + ") anims=" + Object.keys(p.animGroups).join(","));
+    },
+    null,
+    function (_scene, msg) {
+      // No fallback capsule for remotes either.
+      p.loading = false;
+      log("remote clone failed for " + id + " (" + msg + ") — no fallback, remote stays invisible.");
+    }
+  );
+  return p;
+}
+function upsertRemote(id, data) {
+  let p = players.get(id);
+  if (!p) p = cloneRemoteHulk(id, data);
+  if (data.name && data.name !== p.name) { p.name = data.name; if (p.ui) p.ui.setName(data.name); }
+  if (typeof data.health === "number" && data.health !== p.health) { p.health = data.health; if (p.ui) p.ui.setHealth(data.health); }
+  if (data.color && data.color !== p.color) { p.color = data.color; }
+  if (typeof data.score === "number") p.score = data.score;
+  if (typeof data.yaw === "number") p.yaw = data.yaw;
+  if (data.anim && data.anim !== p.anim) { p.anim = data.anim; playRemoteAnim(p, p.anim); }
+  else if (data.anim) { p.anim = data.anim; }
+  if (typeof data.y3d === "number") p.y3d = data.y3d;
+  return p;
+}
+function removeRemote(id) {
+  const p = players.get(id); if (!p) return;
+  p.disposed = true;
+  players.delete(id);
+  try { if (p.ui) p.ui.dispose(); } catch (e) {}
+  try { p.root.dispose(); } catch (e) {}
+}
+
+// --- gems: octahedra, server-spawned only ---------------------------------
+const gemMaterial = new BABYLON.StandardMaterial("gemMat", scene);
+gemMaterial.diffuseColor = new BABYLON.Color3(0.13, 0.83, 0.93);
+gemMaterial.emissiveColor = new BABYLON.Color3(0.1, 0.6, 0.7);
+gemMaterial.specularColor = new BABYLON.Color3(0.5, 0.5, 0.5);
+function addGem(instanceId, x2d, y2d) {
+  if (gems.has(instanceId)) return;
+  const p = to3D(x2d, y2d);
+  const mesh = BABYLON.MeshBuilder.CreatePolyhedron("gem_" + instanceId, { type: 1, size: 0.45 }, scene);
+  mesh.position.set(p.x, GEM_Y, p.z);
+  mesh.material = gemMaterial;
+  gems.set(instanceId, { x2d, y2d, mesh });
+}
+function removeGem(instanceId) {
+  const g = gems.get(instanceId); if (!g) return;
+  try { g.mesh.dispose(); } catch (e) {}
+  gems.delete(instanceId);
+}
+
+// ---------------------------------------------------------------------------
+// Multiplayer — same API as top-down.html
+// ---------------------------------------------------------------------------
+async function join() {
+  const name = $("name").value || "player";
+  const skill = Number($("skill").value || 1000);
+  const disconnectSec = Number($("disconnectSec").value || 60);
+  me.name = name; me.color = colorFor("me-" + name);
+  me.score = 0; me.health = 100;
+  const start = to3D(WORLD_2D / 2 + (Math.random() * 120 - 60), WORLD_2D / 2 + (Math.random() * 120 - 60));
+  heroRoot.position.set(start.x, 0, start.z);
+  const c = to2D(start.x, start.z); me.x = c.x; me.y = c.y;
+  if (heroUI) { heroUI.setName(name + " (you)"); heroUI.setHealth(100); }
+  me.onGround = true; me.isJumping = false; jumpVel = 0;
+  $("hudHealth").textContent = "HP: 100";
+  const res = await api("/api/multiplayer/join", { method: "POST", body: JSON.stringify({
+    environment_name: "babylon-demo",
+    character_name: name,
+    game_id: "babylon-demo",
+    player_id: "demo-" + name.toLowerCase().replace(/\W+/g, "-") + "-" + Math.random().toString(36).slice(2, 6),
+    display_name: name,
+    skill: { rating: skill },
+    config: {
+      game_id: "babylon-demo",
+      requires_matchmaking: false,
+      requires_turn_based: false,
+      max_players_per_room: 8,
+      min_players_per_room: 1,
+      disconnectionTime: disconnectSec,
+      disconnection_time_sec: disconnectSec,
+      empty_game_ttl_sec: 300,
+      authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
+    },
+  })});
+  const data = await res.json();
+  if (!res.ok) { log("join failed: " + JSON.stringify(data)); return; }
+  clientId = data.client_id; sessionId = data.session_id; roomId = data.room_id || null;
+  isSynchronizer = !!data.is_synchronizer;
+  joined = true;
+  $("status").textContent = `Joined as ${name} · Room ${roomId || ""} · ${isSynchronizer ? "synchronizer" : "client"}`;
+  $("hudDisconnect").textContent = `Game data deleted if empty 5 min (on next packet) · Drop if silent: ${data.disconnection_time_sec ?? disconnectSec}s`;
+  $("joinBtn").disabled = true; $("leaveBtn").disabled = false;
+  $("spawnBtn").disabled = true;
+  $("heartbeatBtn").disabled = false; $("jumpBtn").disabled = false;
+  $("damageBtn").disabled = false; $("healBtn").disabled = false; $("resetHpBtn").disabled = false;
+  $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you" : "other"}`;
+  log("joined: " + JSON.stringify(data));
+  connectStream();
+  lastPacketMs = performance.now();
+}
+async function leave() {
+  if (stream) { stream.close(); stream = null; }
+  try { await api("/api/multiplayer/leave", { method: "POST", body: "{}" }); } catch (e) {}
+  clientId = sessionId = roomId = null; isSynchronizer = false; joined = false;
+  for (const id of [...players.keys()]) removeRemote(id);
+  for (const id of [...gems.keys()]) removeGem(id);
+  pendingCollections.clear(); keys.clear();
+  $("status").textContent = "Left."; $("hudSync").textContent = "Synchronizer: —";
+  $("joinBtn").disabled = false; $("leaveBtn").disabled = true;
+  $("spawnBtn").disabled = true; $("heartbeatBtn").disabled = true;
+  $("jumpBtn").disabled = true; $("damageBtn").disabled = true; $("healBtn").disabled = true; $("resetHpBtn").disabled = true;
+  updateHud();
+}
+async function collectGem(instanceId) {
+  if (pendingCollections.has(instanceId)) return;
+  pendingCollections.add(instanceId);
+  const res = await api("/api/multiplayer/item-state", { method: "PATCH", body: JSON.stringify({
+    updates: [], collections: [{ instanceId, collectedByClientId: clientId, environment: "babylon-demo" }], timestamp: Date.now(),
+  })});
+  lastPacketMs = performance.now();
+  if (!res.ok) { pendingCollections.delete(instanceId); log("collect failed: " + res.status); }
+}
+async function sendHeartbeat() {
+  if (!clientId) return;
+  const res = await api("/api/multiplayer/heartbeat", { method: "POST", body: "{}" });
+  const data = await res.json().catch(() => ({}));
+  log("heartbeat -> " + JSON.stringify(data));
+  lastPacketMs = performance.now();
+  if (res.status === 403) { log("heartbeat rejected — you were evicted for timeout, re-join."); await leave(); }
+}
+async function sendCharacterState(force) {
+  if (!clientId) return;
+  const now = performance.now();
+  if (!force && now - lastSentMs < 50) return;
+  lastSentMs = now; lastPacketMs = now;
+  const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
+    updates: [{ clientId, characterModelId: "hulk", position: [me.x, me.y], pos: [me.x, me.y],
+      velocity: [me.vx, me.vy], animationState: me.anim, animationFrame: 0, isJumping: me.isJumping,
+      facing: me.yaw, score: me.score, health: me.health, onGround: me.onGround, timestamp: Date.now(),
+      metadata: { health: me.health, name: me.name, color: me.color, y: heroRoot.position.y } }],
+    timestamp: Date.now(),
+  })});
+  if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
+}
+function handleStreamData(raw) {
+  try {
+    let text = String(raw || "").trim();
+    if (text.startsWith("signals ")) text = text.slice("signals ".length);
+    const data = JSON.parse(text);
+    const signals = data.signals || data;
+    const mp = signals.mp || (signals.match || signals.turnState || signals.characters || signals.items ? signals : null);
+    if (mp) applyMp(mp);
+  } catch (e) { log("stream parse: " + e); }
+}
+function connectStream() {
+  if (!sessionId) return;
+  if (stream) stream.close();
+  stream = new EventSource(`/api/multiplayer/stream?session_id=${encodeURIComponent(sessionId)}`);
+  stream.addEventListener("datastar-patch-signals", (ev) => handleStreamData(ev.data));
+  stream.onmessage = (ev) => handleStreamData(ev.data);
+  stream.onerror = () => { log("stream error — EventSource will retry"); };
+}
+function applyMp(mp) {
+  if (!mp) return;
+  if (mp.connection) {
+    if (typeof mp.connection.isSynchronizer === "boolean" && mp.connection.isSynchronizer !== isSynchronizer) {
+      isSynchronizer = mp.connection.isSynchronizer;
+      $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you (failover)" : "other"}`;
+      $("spawnBtn").disabled = true;
+    }
+    if (mp.connection.roomId) roomId = mp.connection.roomId;
+  }
+  if (Array.isArray(mp.characters)) {
+    for (const c of mp.characters) {
+      if (!c || !c.clientId || c.clientId === clientId) continue;
+      const meta = c.metadata || {};
+      const np = normalizePos(c.position || c.pos);
+      const p = upsertRemote(c.clientId, {
+        name: meta.name || c.characterModelId || "player",
+        color: meta.color || colorFor(c.clientId),
+        health: c.health ?? meta.health ?? 100,
+        score: c.score ?? 0,
+        yaw: typeof c.facing === "number" ? c.facing : (typeof c.rotation === "number" ? c.rotation : 0),
+        anim: c.animationState || "idle",
+        y3d: typeof (c.metadata || {}).y === "number" ? c.metadata.y : (c.isJumping ? 1.2 : 0),
+      });
+      // p is the remote record (cloneRemoteHulk), np is the normalized pos.
+      // Previously this assigned p.x2d = p.x2d and read p.root off the
+      // normalized pos object — remotes never moved and it threw.
+      p.x2d = np.x2d; p.y2d = np.y2d;
+      const t = to3D(p.x2d, p.y2d);
+      p.root.position.set(t.x, p.y3d || 0, t.z);
+      p.root.rotation.y = p.yaw;
+    }
+  }
+  if (mp.items) {
+    if (Array.isArray(mp.items.updates)) {
+      for (const row of mp.items.updates) {
+        if (!row || !row.instanceId) continue;
+        if (row.isCollected) { removeGem(row.instanceId); pendingCollections.delete(row.instanceId); continue; }
+        const p = normalizePos(row.pos || row.position);
+        const ex = gems.get(row.instanceId);
+        if (ex) { const t = to3D(p.x2d, p.y2d); ex.mesh.position.set(t.x, GEM_Y, t.z); ex.x2d = p.x2d; ex.y2d = p.y2d; }
+        else addGem(row.instanceId, p.x2d, p.y2d);
+      }
+    }
+    if (Array.isArray(mp.items.collections)) {
+      for (const coll of mp.items.collections) {
+        if (!coll || !coll.instanceId) continue;
+        const wasMine = coll.collectedByClientId === clientId;
+        removeGem(coll.instanceId); pendingCollections.delete(coll.instanceId);
+        if (wasMine) { me.score += 1; $("hudScore").textContent = `Gems: ${me.score}`; sendCharacterState(true); }
+      }
+    }
+  }
+  if (mp.clientJoined) { log("joined: " + mp.clientJoined.clientId); }
+  if (mp.clientLeft) {
+    const id = mp.clientLeft.clientId;
+    if (id && id !== clientId) removeRemote(id);
+    if (mp.clientLeft.reason === "timeout") log(`player ${id} dropped: timeout (no packet in disconnectionTime)`);
+    else log("left: " + id);
+  }
+  if (mp.synchronizer) { log("synchronizer -> " + JSON.stringify(mp.synchronizer)); }
+  updateHud();
+}
+function updateHud() {
+  $("hudPlayers").textContent = `Players: ${players.size + (joined ? 1 : 0)}`;
+  $("hudGems").textContent = `Gems on map: ${gems.size}`;
+  $("hudScore").textContent = `Gems: ${me.score}`;
+  $("hudHealth").textContent = `HP: ${me.health}`;
+}
+function setHealth(h) {
+  me.health = Math.max(0, Math.min(100, h));
+  if (heroUI) heroUI.setHealth(me.health);
+  $("hudHealth").textContent = `HP: ${me.health}`;
+  sendCharacterState(true);
+}
+
+// --- per-frame: movement + camera + gems + keep-alive (render loop only) ---
+let lastFrameMs = performance.now();
+scene.onBeforeRenderObservable.add(() => {
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - lastFrameMs) / 1000 || 0.016);
+  lastFrameMs = now;
+  if (!joined) {
+    // Still render the world + idle gem spin even before joining.
+    for (const g of gems.values()) { g.mesh.rotation.y += dt * 1.5; g.mesh.position.y = GEM_Y + Math.sin(now / 300 + g.x2d) * 0.15; }
+    return;
+  }
+  let fwd = 0, turn = 0;
+  if (keys.has("w") || keys.has("arrowup")) fwd += 1;
+  if (keys.has("s") || keys.has("arrowdown")) fwd -= 1;
+  if (keys.has("a") || keys.has("arrowleft")) turn -= 1;
+  if (keys.has("d") || keys.has("arrowright")) turn += 1;
+
+  // Tank controls, Playground-style: A/D rotate, W/S move along facing.
+  me.yaw += turn * ROT_SPEED * dt;
+  heroRoot.rotation.y = me.yaw;
+  const speed = fwd > 0 ? SPEED_FWD : fwd < 0 ? -SPEED_BACK : 0;
+  const dx3 = Math.sin(me.yaw) * speed * dt;
+  const dz3 = Math.cos(me.yaw) * speed * dt;
+  const nx = Math.max(-WORLD_3D / 2 + 1, Math.min(WORLD_3D / 2 - 1, heroRoot.position.x + dx3));
+  const nz = Math.max(-WORLD_3D / 2 + 1, Math.min(WORLD_3D / 2 - 1, heroRoot.position.z + dz3));
+  heroRoot.position.x = nx; heroRoot.position.z = nz;
+
+  // Keep 2D server coords in sync with the 3D position.
+  const c2 = to2D(nx, nz);
+  me.x = c2.x; me.y = c2.y;
+  const v2 = { x: (dx3 / Math.max(dt, 1e-4)) / WORLD_3D * WORLD_2D, y: (dz3 / Math.max(dt, 1e-4)) / WORLD_3D * WORLD_2D };
+  me.vx = v2.x; me.vy = v2.y;
+
+  // Jump on fresh Space press (not hold-to-bounce).
+  const spaceDown = keys.has(" ") || keys.has("spacebar");
+  if (spaceDown && !spaceHeldPrev) tryJump();
+  spaceHeldPrev = spaceDown;
+  // Vertical physics: gravity while airborne, land at y=0.
+  if (!me.onGround) {
+    jumpVel -= GRAVITY * dt;
+    let ny = heroRoot.position.y + jumpVel * dt;
+    if (ny <= 0) { ny = 0; jumpVel = 0; me.onGround = true; me.isJumping = false; sendCharacterState(true); }
+    heroRoot.position.y = ny;
+  }
+  // Animation — hulk.glb: jump > run > idle.
+  me.anim = animForInput();
+  playAnim(me.anim);
+
+  // Camera follows hero (Playground: camera.target = hero).
+  camera1.target.x += (heroRoot.position.x - camera1.target.x) * 0.2;
+  camera1.target.z += (heroRoot.position.z - camera1.target.z) * 0.2;
+  camera1.target.y += ((heroRoot.position.y + 1) - camera1.target.y) * 0.2;
+
+  // Gem collision — local check, server confirms via collections broadcast.
+  // Only collect while grounded so you cannot grab gems mid-jump.
+  if (me.onGround) {
+    for (const [id, g] of [...gems.entries()]) {
+      if (Math.hypot(g.mesh.position.x - nx, g.mesh.position.z - nz) < GEM_COLLECT_DIST) collectGem(id);
+    }
+  }
+  // Gems spin + bob.
+  for (const g of gems.values()) { g.mesh.rotation.y += dt * 1.5; g.mesh.position.y = GEM_Y + Math.sin(now / 300 + g.x2d) * 0.15; }
+  // Remotes animate via their own cloned AnimationGroups (playRemoteAnim
+  // in upsertRemote). No per-frame capsule bob — there is no capsule.
+
+  const moved = speed !== 0 || turn !== 0 || !me.onGround;
+  if (moved) sendCharacterState(false);
+  else if (now - lastPacketMs > 10000) sendHeartbeat();
+});
+
+engine.runRenderLoop(() => scene.render());
+addEventListener("resize", () => engine.resize());
+
+// --- buttons ----------------------------------------------------------------
+$("joinBtn").onclick = join;
+$("leaveBtn").onclick = leave;
+$("spawnBtn").onclick = () => log("spawnGems ignored — server owns gems (24 live, respawn on collect).");
+$("heartbeatBtn").onclick = sendHeartbeat;
+$("jumpBtn").onclick = () => tryJump();
+$("damageBtn").onclick = () => setHealth(me.health - 10);
+$("healBtn").onclick = () => setHealth(me.health + 10);
+$("resetHpBtn").onclick = () => setHealth(100);
+updateHud();
+</script>
+</body>
+</html>
