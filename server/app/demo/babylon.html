@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:,">
 <title>Babylon.js — Realtime Demo</title>
 <!--
   babylon.html — realtime multiplayer demo for MATCH (github.com/EricEisaman/match)
@@ -137,10 +138,7 @@ const api = (path, opts = {}) => fetch(path, {
 });
 function colorFor(id) {
   let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  const hue = (h % 360) / 360;
-  const f = (n) => { const k = (((n + hue) % 1) + 1) % 1; if (k < 1 / 6) return 0.55 + 0.45 * 6 * k; if (k < 1 / 2) return 1.0; if (k < 2 / 3) return 0.55 + 0.45 * (2 / 3 - k) * 6; return 0.55; };
-  const r = Math.round(255 * f(1 / 3)), g = Math.round(255 * f(0)), b = Math.round(255 * f(-1 / 3));
-  return "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
+  return `hsl(${h % 360} 70% 55%)`;
 }
 // --- coordinate mapping: server 2000-space <-> Babylon 80-space -----------
 function to3D(x2d, y2d) { return { x: (x2d / WORLD_2D - 0.5) * WORLD_3D, z: (y2d / WORLD_2D - 0.5) * WORLD_3D }; }
@@ -239,10 +237,10 @@ ground.material = groundMaterial;
     if (rnd() > 0.5) {
       const trunk = BABYLON.MeshBuilder.CreateCylinder("trunk", { height: 1.6, diameter: 0.4 }, scene);
       trunk.position.set(x, 0.8, z); trunk.material = trunkMat;
-      const leaves = BABYLON.MeshBuilder.CreateCone("leaves", { height: 2.2, diameter: 1.8 }, scene);
+      const leaves = BABYLON.MeshBuilder.CreateCylinder("leaves", { height: 2.2, diameterTop: 0, diameterBottom: 1.8 }, scene);
       leaves.position.set(x, 2.6, z); leaves.material = leafMat;
     } else {
-      const rock = BABYLON.MeshBuilder.CreateIcoSphere("rock", { radius: 0.5 + rnd() * 0.5 }, scene);
+      const rock = BABYLON.MeshBuilder.CreateSphere("rock", { diameter: 1.0 + rnd() * 1.0 }, scene);
       rock.position.set(x, 0.35, z); rock.material = rockMat; rock.scaling.y = 0.7;
     }
   }
@@ -555,9 +553,10 @@ async function sendCharacterState(force) {
   if (!force && now - lastSentMs < 50) return;
   lastSentMs = now; lastPacketMs = now;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, position: [me.x, me.y],
-      animationState: me.anim, health: me.health, score: me.score,
-      metadata: { name: me.name, color: me.color, yaw: me.yaw } }],
+    updates: [{ clientId, characterModelId: "HVGirl", position: [me.x, me.y], pos: [me.x, me.y],
+      velocity: [me.vx, me.vy], animationState: me.anim, animationFrame: 0, isJumping: false,
+      facing: me.yaw, score: me.score, health: me.health, onGround: true, timestamp: Date.now(),
+      metadata: { health: me.health, name: me.name, color: me.color } }],
     timestamp: Date.now(),
   })});
   if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
@@ -594,22 +593,17 @@ function applyMp(mp) {
     for (const c of mp.characters) {
       if (!c || !c.clientId || c.clientId === clientId) continue;
       const meta = c.metadata || {};
-      const pos = normalizePos(c.position || c.pos);
-      // Babylon yaw is OUR per-game schema -> metadata.yaw (float radians).
-      // Top-level `facing` is top-down's schema: int -1/1 only. Only use it
-      // as a fallback for a cross-game peer, converted to a yaw.
-      const yaw = typeof meta.yaw === "number" ? meta.yaw
-        : typeof c.facing === "number" ? c.facing * Math.PI / 2 : 0;
-      const p = upsertRemote(c.clientId, {
+      const p = normalizePos(c.position || c.pos);
+      const p2 = upsertRemote(c.clientId, {
         name: meta.name || c.characterModelId || "player",
         color: meta.color || colorFor(c.clientId),
         health: c.health ?? meta.health ?? 100,
         score: c.score ?? 0,
-        yaw,
+        yaw: typeof c.facing === "number" ? c.facing : (typeof c.rotation === "number" ? c.rotation : 0),
         anim: c.animationState || "stand",
       });
-      p.x2d = pos.x2d; p.y2d = pos.y2d;
-      const t = to3D(pos.x2d, pos.y2d);
+      p.x2d = p.x2d; p.y2d = p.y2d;
+      const t = to3D(p.x2d, p.y2d);
       p.root.position.set(t.x, 0, t.z);
       p.root.rotation.y = p.yaw;
     }
