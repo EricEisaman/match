@@ -1814,5 +1814,7 @@ async def demo_babylon_page_html():
 # two new demo routes ahead of it. No existing route is edited or removed.
 _demo_new = [r for r in app.routes if getattr(r, "path", "") in ("/demo/hulk.glb", "/demo/babylon.html")]
 _demo_rest = [r for r in app.routes if getattr(r, "path", "") not in ("/demo/hulk.glb", "/demo/babylon.html")]
-app.routes = _demo_new + _demo_rest
+# FIX: app.routes is a read-only property (no setter) — assigning it crashes on import.
+# Mutate the underlying list in place instead. Same order, no route edited/removed.
+app.router.routes[:] = _demo_new + _demo_rest
 
