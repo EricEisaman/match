@@ -239,10 +239,10 @@ ground.material = groundMaterial;
     if (rnd() > 0.5) {
       const trunk = BABYLON.MeshBuilder.CreateCylinder("trunk", { height: 1.6, diameter: 0.4 }, scene);
       trunk.position.set(x, 0.8, z); trunk.material = trunkMat;
-      const leaves = BABYLON.MeshBuilder.CreateCylinder("leaves", { height: 2.2, diameterTop: 0, diameterBottom: 1.8 }, scene);
+      const leaves = BABYLON.MeshBuilder.CreateCone("leaves", { height: 2.2, diameter: 1.8 }, scene);
       leaves.position.set(x, 2.6, z); leaves.material = leafMat;
     } else {
-      const rock = BABYLON.MeshBuilder.CreateSphere("rock", { diameter: 1.0 + rnd() * 1.0 }, scene);
+      const rock = BABYLON.MeshBuilder.CreateIcoSphere("rock", { radius: 0.5 + rnd() * 0.5 }, scene);
       rock.position.set(x, 0.35, z); rock.material = rockMat; rock.scaling.y = 0.7;
     }
   }
@@ -320,25 +320,47 @@ function createCharacterUI(mesh, characterName, maxHealth, isMe) {
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Hero — Playground HVGirl, parented to a TransformNode we actually move.
-// No fallback. If HVGirl fails to load, it fails loudly in the log.
-// No capsule placeholder, no skib stand-in.
+// If the GLB fails (offline / blocked), fall back to a capsule so the
+// demo is still playable and the name/health bars still work.
 // ---------------------------------------------------------------------------
 const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
 heroRoot.position.set(0, 0, 0);
 let heroMesh = null;          // mesh the UI links to (GLB root or capsule)
 let heroUI = null;
+let fallbackMesh = null;      // capsule shown while HVGirl loads; disposed on load
 let animGroups = {};          // Walking / WalkingBack / Idle / Samba
 let currentAnim = "";
 let heroLoaded = false;
 
+function makeFallbackHero() {
+  if (fallbackMesh) return fallbackMesh;
+  const cap = BABYLON.MeshBuilder.CreateCapsule("heroCapsule", { height: 1.8, radius: 0.42 }, scene);
+  cap.parent = heroRoot; cap.position.y = 0.9;
+  const mat = new BABYLON.StandardMaterial("heroMat", scene);
+  mat.diffuseColor = BABYLON.Color3.FromHexString("#4da3ff");
+  mat.emissiveColor = new BABYLON.Color3(0.05, 0.1, 0.2);
+  cap.material = mat;
+  const head = BABYLON.MeshBuilder.CreateSphere("heroHead", { diameter: 0.55 }, scene);
+  head.parent = heroRoot; head.position.y = 2.05; head.material = mat;
+  fallbackMesh = cap;
+  return cap;
+}
 function ensureHeroUI() {
   if (heroUI || !heroMesh) return;
   heroUI = createCharacterUI(heroMesh, me.name + " (you)", me.health, true);
 }
 BABYLON.SceneLoader.ImportMesh("", "https://assets.babylonjs.com/meshes/", "HVGirl.glb", scene,
   function (newMeshes, _ps, _skeletons, animationGroups) {
+    // If a fallback capsule was shown while loading, remove it + its UI
+    // so we don't end up with two heroes / two name bars.
+    if (fallbackMesh) {
+      try { if (heroUI) heroUI.dispose(); } catch (e) {}
+      heroUI = null;
+      try { fallbackMesh.dispose(); } catch (e) {}
+      try { scene.getMeshByName("heroHead")?.dispose(); } catch (e) {}
+      fallbackMesh = null;
+    }
     heroMesh = newMeshes[0];
     heroMesh.parent = heroRoot;
     heroMesh.scaling.scaleInPlace(0.1);
@@ -351,9 +373,13 @@ BABYLON.SceneLoader.ImportMesh("", "https://assets.babylonjs.com/meshes/", "HVGi
   },
   null,
   function (_scene, msg) {
-    log("HVGirl failed to load (" + msg + ") — no fallback, hero stays missing.");
+    log("HVGirl failed to load (" + msg + ") — using capsule fallback.");
+    if (!heroMesh) { heroMesh = makeFallbackHero(); ensureHeroUI(); }
   }
 );
+// If the GLB is slow, show a capsule immediately so the scene is not empty;
+// it is removed once HVGirl arrives.
+setTimeout(() => { if (!heroLoaded && !heroMesh) { heroMesh = makeFallbackHero(); ensureHeroUI(); } }, 2500);
 
 function playAnim(name) {
   if (currentAnim === name) return;
@@ -370,7 +396,7 @@ function animForInput() {
   return "Idle";
 }
 
-// --- keyboard: Playground ActionManager + window key handling for arrows ------
+// --- keyboard: Playground ActionManager + window fallback for arrows ------
 const inputMap = {};
 scene.actionManager = new BABYLON.ActionManager(scene);
 scene.actionManager.registerAction(new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyDownTrigger, (evt) => {
@@ -463,6 +489,7 @@ async function join() {
     character_name: name,
     game_id: "babylon-demo",
     player_id: "demo-" + name.toLowerCase().replace(/\W+/g, "-") + "-" + Math.random().toString(36).slice(2, 6),
+    display_name: name,
     skill: { rating: skill },
     config: {
       game_id: "babylon-demo",
@@ -470,8 +497,10 @@ async function join() {
       requires_turn_based: false,
       max_players_per_room: 8,
       min_players_per_room: 1,
+      disconnectionTime: disconnectSec,
       disconnection_time_sec: disconnectSec,
       empty_game_ttl_sec: 300,
+      authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
     },
   })});
   const data = await res.json();
@@ -525,21 +554,13 @@ async function sendCharacterState(force) {
   const now = performance.now();
   if (!force && now - lastSentMs < 50) return;
   lastSentMs = now; lastPacketMs = now;
-  // Guard: never send a corrupt packet. JSON.stringify turns NaN/Infinity
-  // into null, and the server's from_payload rejects nulls with 422.
-  if (![me.x, me.y, me.yaw].every(Number.isFinite)) return;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, position: [me.x, me.y], facing: me.yaw,
+    updates: [{ clientId, position: [me.x, me.y],
       animationState: me.anim, health: me.health, score: me.score,
-      metadata: { name: me.name, color: me.color } }],
+      metadata: { name: me.name, color: me.color, yaw: me.yaw } }],
     timestamp: Date.now(),
   })});
-  if (!res.ok) {
-    // 422 body IS the validator's message — log it, don't swallow it.
-    const d = await res.json().catch(() => ({}));
-    log("character-state " + res.status + ": " + JSON.stringify(d));
-    if (res.status === 403) await leave();
-  }
+  if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
 }
 function handleStreamData(raw) {
   try {
@@ -573,17 +594,22 @@ function applyMp(mp) {
     for (const c of mp.characters) {
       if (!c || !c.clientId || c.clientId === clientId) continue;
       const meta = c.metadata || {};
-      const p = normalizePos(c.position || c.pos);
-      const p2 = upsertRemote(c.clientId, {
+      const pos = normalizePos(c.position || c.pos);
+      // Babylon yaw is OUR per-game schema -> metadata.yaw (float radians).
+      // Top-level `facing` is top-down's schema: int -1/1 only. Only use it
+      // as a fallback for a cross-game peer, converted to a yaw.
+      const yaw = typeof meta.yaw === "number" ? meta.yaw
+        : typeof c.facing === "number" ? c.facing * Math.PI / 2 : 0;
+      const p = upsertRemote(c.clientId, {
         name: meta.name || c.characterModelId || "player",
         color: meta.color || colorFor(c.clientId),
         health: c.health ?? meta.health ?? 100,
         score: c.score ?? 0,
-        yaw: typeof c.facing === "number" ? c.facing : (typeof c.rotation === "number" ? c.rotation : 0),
+        yaw,
         anim: c.animationState || "stand",
       });
-      p.x2d = p.x2d; p.y2d = p.y2d;
-      const t = to3D(p.x2d, p.y2d);
+      p.x2d = pos.x2d; p.y2d = pos.y2d;
+      const t = to3D(pos.x2d, pos.y2d);
       p.root.position.set(t.x, 0, t.z);
       p.root.rotation.y = p.yaw;
     }
@@ -650,7 +676,6 @@ scene.onBeforeRenderObservable.add(() => {
 
   // Tank controls, Playground-style: A/D rotate, W/S move along facing.
   me.yaw += turn * ROT_SPEED * dt;
-  me.yaw = Math.atan2(Math.sin(me.yaw), Math.cos(me.yaw)); // [-PI, PI], same direction
   heroRoot.rotation.y = me.yaw;
   const speed = fwd > 0 ? SPEED_FWD : fwd < 0 ? -SPEED_BACK : 0;
   const dx3 = Math.sin(me.yaw) * speed * dt;
