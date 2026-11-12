@@ -320,9 +320,9 @@ function createCharacterUI(mesh, characterName, maxHealth, isMe) {
 }
 
 // ---------------------------------------------------------------------------
-// Basis + clones: load ONE HVGirl.glb as hidden basis, never added to scene.
-// Local player = clone 0, every remote = successive clone, all from the
-// same makeClone() factory. No primitives, no fallback capsule.
+// Hero — Playground HVGirl, parented to a TransformNode we actually move.
+// If the GLB fails (offline / blocked), fall back to a capsule so the
+// demo is still playable and the name/health bars still work.
 // ---------------------------------------------------------------------------
 const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
 heroRoot.position.set(0, 0, 0);
@@ -342,10 +342,11 @@ function firstMeshOf(root) {
   const meshes = root.getChildMeshes ? root.getChildMeshes(false) : [];
   return meshes[0] || root;
 }
-// Single clone factory: every player, local + remote, comes from here.
 function makeClone(parent, suffix) {
   const inst = modelContainer.instantiateModelsToScene((name) => name + suffix);
   const root = inst.rootNodes[0];
+  try { root.setEnabled(true); } catch (e) {}
+  try { for (const m of root.getChildMeshes(false)) m.setEnabled(true); } catch (e) {}
   root.parent = parent;
   root.scaling.scaleInPlace(0.1);
   root.position.set(0, 0, 0);
@@ -355,11 +356,8 @@ function makeClone(parent, suffix) {
   return { root, mesh, animGroups: groups };
 }
 BABYLON.SceneLoader.LoadAssetContainerAsync("", "https://assets.babylonjs.com/meshes/", "HVGirl.glb", scene).then((container) => {
-  // Basis first, hidden: never added to scene, never visible. Clones only.
-  for (const m of container.meshes) m.setEnabled(false);
   modelContainer = container;
   modelReady = true;
-  // Local player = clone 0
   const heroClone = makeClone(heroRoot, "_hero");
   heroMesh = heroClone.mesh;
   heroLoaded = true;
@@ -421,7 +419,6 @@ function playRemoteAnim(p, anim) {
 }
 function attachCloneToRemote(p) {
   if (p.cloneAttached || !modelReady) return;
-  // Successive clone from the same hidden basis
   const c = makeClone(p.root, "_" + p.id);
   p.clone = c.root;
   p.mesh = c.mesh;
