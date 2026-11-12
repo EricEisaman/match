@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="icon" href="data:,">
 <title>Babylon.js — Realtime Demo</title>
 <!--
   babylon.html — realtime multiplayer demo for MATCH (github.com/EricEisaman/match)
@@ -321,66 +320,61 @@ function createCharacterUI(mesh, characterName, maxHealth, isMe) {
 }
 
 // ---------------------------------------------------------------------------
-// Hero — Playground HVGirl, parented to a TransformNode we actually move.
-// If the GLB fails (offline / blocked), fall back to a capsule so the
-// demo is still playable and the name/health bars still work.
+// Basis + clones: load ONE HVGirl.glb as hidden basis, never added to scene.
+// Local player = clone 0, every remote = successive clone, all from the
+// same makeClone() factory. No primitives, no fallback capsule.
 // ---------------------------------------------------------------------------
 const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
 heroRoot.position.set(0, 0, 0);
-let heroMesh = null;          // mesh the UI links to (GLB root or capsule)
+let heroMesh = null;
 let heroUI = null;
-let fallbackMesh = null;      // capsule shown while HVGirl loads; disposed on load
-let animGroups = {};          // Walking / WalkingBack / Idle / Samba
+let animGroups = {};
 let currentAnim = "";
 let heroLoaded = false;
-
-function makeFallbackHero() {
-  if (fallbackMesh) return fallbackMesh;
-  const cap = BABYLON.MeshBuilder.CreateCapsule("heroCapsule", { height: 1.8, radius: 0.42 }, scene);
-  cap.parent = heroRoot; cap.position.y = 0.9;
-  const mat = new BABYLON.StandardMaterial("heroMat", scene);
-  mat.diffuseColor = BABYLON.Color3.FromHexString("#4da3ff");
-  mat.emissiveColor = new BABYLON.Color3(0.05, 0.1, 0.2);
-  cap.material = mat;
-  const head = BABYLON.MeshBuilder.CreateSphere("heroHead", { diameter: 0.55 }, scene);
-  head.parent = heroRoot; head.position.y = 2.05; head.material = mat;
-  fallbackMesh = cap;
-  return cap;
-}
+let modelContainer = null;
+let modelReady = false;
+const pendingRemoteIds = new Set();
 function ensureHeroUI() {
   if (heroUI || !heroMesh) return;
   heroUI = createCharacterUI(heroMesh, me.name + " (you)", me.health, true);
 }
-BABYLON.SceneLoader.ImportMesh("", "https://assets.babylonjs.com/meshes/", "HVGirl.glb", scene,
-  function (newMeshes, _ps, _skeletons, animationGroups) {
-    // If a fallback capsule was shown while loading, remove it + its UI
-    // so we don't end up with two heroes / two name bars.
-    if (fallbackMesh) {
-      try { if (heroUI) heroUI.dispose(); } catch (e) {}
-      heroUI = null;
-      try { fallbackMesh.dispose(); } catch (e) {}
-      try { scene.getMeshByName("heroHead")?.dispose(); } catch (e) {}
-      fallbackMesh = null;
-    }
-    heroMesh = newMeshes[0];
-    heroMesh.parent = heroRoot;
-    heroMesh.scaling.scaleInPlace(0.1);
-    heroMesh.position.set(0, 0, 0);
-    heroLoaded = true;
-    for (const g of animationGroups) animGroups[g.name] = g;
-    playAnim("Idle");
-    ensureHeroUI();
-    log("HVGirl loaded: " + Object.keys(animGroups).join(", "));
-  },
-  null,
-  function (_scene, msg) {
-    log("HVGirl failed to load (" + msg + ") — using capsule fallback.");
-    if (!heroMesh) { heroMesh = makeFallbackHero(); ensureHeroUI(); }
+function firstMeshOf(root) {
+  const meshes = root.getChildMeshes ? root.getChildMeshes(false) : [];
+  return meshes[0] || root;
+}
+// Single clone factory: every player, local + remote, comes from here.
+function makeClone(parent, suffix) {
+  const inst = modelContainer.instantiateModelsToScene((name) => name + suffix);
+  const root = inst.rootNodes[0];
+  root.parent = parent;
+  root.scaling.scaleInPlace(0.1);
+  root.position.set(0, 0, 0);
+  const mesh = firstMeshOf(root);
+  const groups = {};
+  for (const g of inst.animationGroups) groups[g.name] = g;
+  return { root, mesh, animGroups: groups };
+}
+BABYLON.SceneLoader.LoadAssetContainerAsync("", "https://assets.babylonjs.com/meshes/", "HVGirl.glb", scene).then((container) => {
+  // Basis first, hidden: never added to scene, never visible. Clones only.
+  for (const m of container.meshes) m.setEnabled(false);
+  modelContainer = container;
+  modelReady = true;
+  // Local player = clone 0
+  const heroClone = makeClone(heroRoot, "_hero");
+  heroMesh = heroClone.mesh;
+  heroLoaded = true;
+  animGroups = heroClone.animGroups;
+  playAnim("Idle");
+  ensureHeroUI();
+  log("HVGirl loaded: " + Object.keys(animGroups).join(", "));
+  for (const id of [...pendingRemoteIds]) {
+    const pp = players.get(id);
+    if (pp) attachCloneToRemote(pp);
   }
-);
-// If the GLB is slow, show a capsule immediately so the scene is not empty;
-// it is removed once HVGirl arrives.
-setTimeout(() => { if (!heroLoaded && !heroMesh) { heroMesh = makeFallbackHero(); ensureHeroUI(); } }, 2500);
+  pendingRemoteIds.clear();
+}).catch((e) => {
+  log("HVGirl failed to load: " + (e && e.message ? e.message : e));
+});
 
 function playAnim(name) {
   if (currentAnim === name) return;
@@ -412,44 +406,57 @@ addEventListener("keydown", (e) => {
 });
 addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 
-// --- remote players: capsule avatar + linked name/health UI ----------------
-function createRemoteAvatar(id, name, colorHex) {
-  const root = new BABYLON.TransformNode("player_" + id, scene);
-  const cap = BABYLON.MeshBuilder.CreateCapsule("avatar_" + id, { height: 1.8, radius: 0.42 }, scene);
-  cap.parent = root; cap.position.y = 0.9;
-  const mat = new BABYLON.StandardMaterial("mat_" + id, scene);
-  try { mat.diffuseColor = BABYLON.Color3.FromHexString(colorHex.startsWith("#") ? colorHex : "#ffaa33"); }
-  catch (e) { mat.diffuseColor = new BABYLON.Color3(1, 0.66, 0.2); }
-  cap.material = mat;
-  const head = BABYLON.MeshBuilder.CreateSphere("head_" + id, { diameter: 0.55 }, scene);
-  head.parent = root; head.position.y = 2.05; head.material = mat;
-  const ui = createCharacterUI(cap, name, 100, false);
-  return { root, capsule: cap, ui };
+// --- remote players: clones of the SAME HVGirl.glb -------------------------
+function animNameForRemote(anim) {
+  return anim === "run" ? "Walking" : anim === "walkBack" ? "WalkingBack" : anim === "samba" ? "Samba" : "Idle";
+}
+function playRemoteAnim(p, anim) {
+  const target = animNameForRemote(anim);
+  if (p.animName === target) return;
+  p.animName = target;
+  const g = p.animGroups ? p.animGroups[target] : null;
+  if (!g) return;
+  for (const k of Object.keys(p.animGroups || {})) { if (k !== target) p.animGroups[k].stop(); }
+  g.start(true, 1.0, g.from, g.to, false);
+}
+function attachCloneToRemote(p) {
+  if (p.cloneAttached || !modelReady) return;
+  // Successive clone from the same hidden basis
+  const c = makeClone(p.root, "_" + p.id);
+  p.clone = c.root;
+  p.mesh = c.mesh;
+  p.animGroups = c.animGroups;
+  p.cloneAttached = true;
+  p.ui = createCharacterUI(c.mesh, p.name, 100, false);
+  p.ui.setHealth(p.health);
+  playRemoteAnim(p, p.anim);
 }
 function upsertRemote(id, data) {
   let p = players.get(id);
   if (!p) {
-    const av = createRemoteAvatar(id, data.name || "player", data.color || colorFor(id));
-    p = { x2d: WORLD_2D / 2, y2d: WORLD_2D / 2, health: 100, score: 0, name: data.name || "player",
-          color: data.color || colorFor(id), yaw: 0, anim: "stand", ...av };
+    const root = new BABYLON.TransformNode("player_" + id, scene);
+    p = { id, x2d: WORLD_2D / 2, y2d: WORLD_2D / 2, health: 100, score: 0, name: data.name || "player",
+          color: data.color || colorFor(id), yaw: 0, anim: "stand", animName: "", animGroups: {},
+          root, clone: null, mesh: null, ui: null, cloneAttached: false };
     players.set(id, p);
+    if (modelReady) attachCloneToRemote(p);
+    else pendingRemoteIds.add(id);
   }
-  if (data.name && data.name !== p.name) { p.name = data.name; p.ui.setName(data.name); }
-  if (typeof data.health === "number" && data.health !== p.health) { p.health = data.health; p.ui.setHealth(data.health); }
-  if (data.color && data.color !== p.color) {
-    p.color = data.color;
-    try { p.capsule.material.diffuseColor = BABYLON.Color3.FromHexString(data.color); } catch (e) {}
-  }
+  if (data.name && data.name !== p.name) { p.name = data.name; if (p.ui) p.ui.setName(data.name); }
+  if (typeof data.health === "number" && data.health !== p.health) { p.health = data.health; if (p.ui) p.ui.setHealth(data.health); }
+  if (data.color) p.color = data.color;
   if (typeof data.score === "number") p.score = data.score;
   if (typeof data.yaw === "number") p.yaw = data.yaw;
-  if (data.anim) p.anim = data.anim;
+  if (data.anim && data.anim !== p.anim) { p.anim = data.anim; if (p.cloneAttached) playRemoteAnim(p, p.anim); }
   return p;
 }
 function removeRemote(id) {
   const p = players.get(id); if (!p) return;
-  try { p.ui.dispose(); } catch (e) {}
+  try { if (p.ui) p.ui.dispose(); } catch (e) {}
+  try { for (const g of Object.values(p.animGroups || {})) g.stop(); } catch (e) {}
   try { p.root.dispose(); } catch (e) {}
   players.delete(id);
+  pendingRemoteIds.delete(id);
 }
 
 // --- gems: octahedra, server-spawned only ---------------------------------
@@ -704,10 +711,9 @@ scene.onBeforeRenderObservable.add(() => {
   }
   // Gems spin + bob.
   for (const g of gems.values()) { g.mesh.rotation.y += dt * 1.5; g.mesh.position.y = GEM_Y + Math.sin(now / 300 + g.x2d) * 0.15; }
-  // Remote bob when moving.
+  // Remote bob when moving (root bob, GLB has no capsule).
   for (const p of players.values()) {
-    if (p.anim === "run" || p.anim === "walkBack") p.capsule.position.y = 0.9 + Math.abs(Math.sin(now / 120)) * 0.08;
-    else p.capsule.position.y = 0.9;
+    p.root.position.y = (p.anim === "run" || p.anim === "walkBack") ? Math.abs(Math.sin(now / 120)) * 0.08 : 0;
   }
 
   const moved = speed !== 0 || turn !== 0;
