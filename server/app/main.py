@@ -1739,3 +1739,80 @@ async def root():
         "signals": ["mp"],
         "python_api": "extensions.multiplayer.MultiplayerClient",
     }
+
+
+# ---------------------------------------------------------------------------
+# ADDED ONLY: Babylon demo file serving. Nothing above changed.
+# Protocol untouched: no join / stream / character / item / turn / match
+# logic touched, no _is_top_down_game change, no gem logic change.
+# The old _serve_demo_file() only serves *.html. Babylon needs its binary
+# hulk.glb too, and babylon.html loads "hulk.glb" relatively. So this
+# block adds a second helper for binary files + new routes only.
+# ---------------------------------------------------------------------------
+from fastapi.responses import FileResponse as _BabylonFileResponse
+
+_BABYLON_DEMO_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".bin": "application/octet-stream",
+    ".js": "text/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".css": "text/css; charset=utf-8",
+}
+
+
+def _serve_demo_binary_file(filename: str):
+    """Serve one file from demo/ with the right MIME. No traversal."""
+    safe = str(filename or "").strip()
+    if not safe or "/" in safe or "\\" in safe or ".." in safe:
+        raise HTTPException(400, "Invalid demo file")
+    if any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in safe):
+        raise HTTPException(400, "Invalid demo file")
+    suffix = _path.Path(safe).suffix.lower()
+    if suffix not in _BABYLON_DEMO_MIME:
+        raise HTTPException(404, "Demo file not found")
+    demo_file = _path.Path(__file__).parent / "demo" / safe
+    if not demo_file.exists() or not demo_file.is_file():
+        raise HTTPException(404, "Demo file not found")
+    headers = {"Cache-Control": "no-cache"} if suffix == ".html" else {"Cache-Control": "public, max-age=3600", "Accept-Ranges": "bytes"}
+    return _BabylonFileResponse(str(demo_file), media_type=_BABYLON_DEMO_MIME[suffix], headers=headers)
+
+
+@app.get("/babylon", include_in_schema=False)
+async def babylon_demo_page():
+    """Babylon demo — same file as /demo/babylon."""
+    return _serve_demo_binary_file("babylon.html")
+
+
+@app.get("/babylon.html", include_in_schema=False)
+async def babylon_demo_page_html():
+    return _serve_demo_binary_file("babylon.html")
+
+
+@app.get("/hulk.glb", include_in_schema=False)
+async def hulk_model():
+    """hulk.glb for /babylon (relative 'hulk.glb' -> /hulk.glb)."""
+    return _serve_demo_binary_file("hulk.glb")
+
+
+@app.get("/demo/hulk.glb", include_in_schema=False)
+async def demo_hulk_model():
+    """hulk.glb for /demo/babylon (relative 'hulk.glb' -> /demo/hulk.glb)."""
+    return _serve_demo_binary_file("hulk.glb")
+
+
+@app.get("/demo/babylon.html", include_in_schema=False)
+async def demo_babylon_page_html():
+    return _serve_demo_binary_file("babylon.html")
+
+
+# /demo/{name} is registered before this block, so Starlette would match
+# /demo/hulk.glb and /demo/babylon.html against it first. Move only these
+# two new demo routes ahead of it. No existing route is edited or removed.
+_demo_new = [r for r in app.routes if getattr(r, "path", "") in ("/demo/hulk.glb", "/demo/babylon.html")]
+_demo_rest = [r for r in app.routes if getattr(r, "path", "") not in ("/demo/hulk.glb", "/demo/babylon.html")]
+app.routes = _demo_new + _demo_rest
+
