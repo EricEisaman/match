@@ -529,7 +529,7 @@ async function sendCharacterState(force) {
   // into null, and the server's from_payload rejects nulls with 422.
   if (![me.x, me.y, me.yaw].every(Number.isFinite)) return;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, pos: [me.x, me.y], facing: me.yaw,
+    updates: [{ clientId, position: [me.x, me.y], facing: me.yaw,
       animationState: me.anim, health: me.health, score: me.score,
       metadata: { name: me.name, color: me.color } }],
     timestamp: Date.now(),
