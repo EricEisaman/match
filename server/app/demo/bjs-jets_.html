@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BJS Jets — Multiplayer</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#0a1420;color:#e9f7ff;font:14px/1.5 system-ui,monospace;overflow:hidden}
+  #topbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;background:#0f1f30;border-bottom:1px solid #22344a;position:relative;z-index:20}
+  #topbar h1{font-size:16px;margin:0 8px 0 0;letter-spacing:.04em}
+  #topbar input{padding:7px 9px;border-radius:6px;border:1px solid #2b425c;background:#0a1624;color:#e9f7ff;outline:none}
+  #topbar input[type=number]{width:82px}
+  #topbar button{padding:8px 12px;border-radius:6px;border:1px solid #2b425c;background:#16324a;color:#e9f7ff;cursor:pointer}
+  #topbar button:disabled{opacity:.45;cursor:default}
+  #topbar button.primary{background:#ff713d;border-color:#ff713d;color:#fff;font-weight:700}
+  #status{margin-left:auto;font-size:12px;opacity:.85}
+  #wrap{position:relative;height:calc(100% - 53px)}
+  #renderCanvas{width:100%;height:100%;display:block;touch-action:none;outline:none}
+  #hud{position:absolute;left:16px;top:16px;color:#e9f7ff;background:rgba(8,20,35,.65);padding:12px 16px;border-radius:8px;font:13px/1.6 monospace;pointer-events:none;z-index:10;white-space:pre}
+  /* Circular radar */
+  #radarWrap{position:absolute;right:16px;top:16px;z-index:10;display:flex;flex-direction:column;align-items:center;gap:6px;pointer-events:none}
+  #radar{width:180px;height:180px;border-radius:50%;background:radial-gradient(circle at 50% 50%, rgba(10,30,45,.92) 0%, rgba(8,20,35,.92) 62%, rgba(4,12,20,.95) 100%);border:2px solid rgba(120,220,255,.55);box-shadow:0 0 0 1px rgba(0,0,0,.35), 0 10px 30px rgba(0,0,0,.35);position:relative;overflow:hidden}
+  #radar canvas{width:100%;height:100%;display:block;border-radius:50%}
+  #radarLabel{font:11px/1.2 monospace;letter-spacing:.18em;color:#9fd8ff;text-align:center}
+  #radarLegend{font:11px/1.5 monospace;color:#cfeaff;background:rgba(8,20,35,.65);padding:6px 8px;border-radius:6px;max-width:190px;white-space:pre}
+  #log{position:absolute;left:16px;bottom:16px;z-index:10;background:rgba(8,20,35,.72);padding:8px 10px;border-radius:6px;font:11px/1.5 monospace;max-width:420px;max-height:120px;overflow:auto;white-space:pre-wrap}
+  #fsBtn{position:absolute;right:16px;bottom:16px;z-index:20;padding:10px 14px;border-radius:8px;border:1px solid #2b425c;background:rgba(8,20,35,.85);color:#e9f7ff;cursor:pointer;font:13px monospace}
+  #fsBtn:hover{background:#16324a}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>✈️ BJS JETS</h1>
+  <label>Name <input id="name" value="Dale"/></label>
+  <label>Skill <input id="skill" type="number" value="1000"/></label>
+  <label>Timeout <input id="disconnectSec" type="number" value="60"/></label>
+  <button id="joinBtn" class="primary">Join</button>
+  <button id="leaveBtn" disabled>Leave</button>
+  <button id="resetBtn">Reset (R)</button>
+  <button id="fsTopBtn">⛶ Fullscreen</button>
+  <span id="status">Not joined.</span>
+</div>
+<div id="wrap">
+  <canvas id="renderCanvas"></canvas>
+  <div id="hud">JET FLIGHT</div>
+  <div id="radarWrap">
+    <div id="radar"><canvas id="radarCanvas" width="360" height="360"></canvas></div>
+    <div id="radarLabel">RADAR • HEADING-UP</div>
+    <div id="radarLegend">You — white ▲&#10;Others — colored ●</div>
+  </div>
+  <div id="log"></div>
+  <button id="fsBtn">⛶ Fullscreen</button>
+</div>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const canvas = $("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true);
+const scene = new BABYLON.Scene(engine);
+scene.clearColor = new BABYLON.Color4(0.48, 0.73, 0.94, 1);
+scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
+scene.fogDensity = 0.0015;
+scene.fogColor = new BABYLON.Color3(0.48, 0.73, 0.94);
+const V3 = BABYLON.Vector3, C3 = BABYLON.Color3, clamp = BABYLON.Scalar.Clamp;
+
+// ---------- Multiplayer — own game id, NOT top-down / babylon ----------
+const GAME_ID = "bjs-jets-demo";
+const ENV_NAME = "bjs-jets-demo";
+const WORLD_2D = 2000;      // server 2D space
+const JET_RANGE = 2400;     // Babylon XZ: -1200..+1200 maps to 0..2000
+function to3D(x2d, y2d){ return { x:(x2d/WORLD_2D-0.5)*JET_RANGE, z:(y2d/WORLD_2D-0.5)*JET_RANGE }; }
+function to2D(x3d, z3d){ return { x:(x3d/JET_RANGE+0.5)*WORLD_2D, y:(z3d/JET_RANGE+0.5)*WORLD_2D }; }
+function normalizePos(pos){
+  if(!Array.isArray(pos)||pos.length<2) return {x2d:WORLD_2D/2, y2d:WORLD_2D/2};
+  return {x2d:pos[0], y2d:pos[1]};
+}
+function colorFor(id){
+  let h=0; for(const c of String(id)) h=(h*31+c.charCodeAt(0))>>>0;
+  const hue=(h%360)/360;
+  const f=(n)=>{const k=(((n+hue)%1)+1)%1; if(k<1/6) return 0.55+0.45*6*k; if(k<1/2) return 1.0; if(k<2/3) return 0.55+0.45*(2/3-k)*6; return 0.55;};
+  const r=Math.round(255*f(1/3)), g=Math.round(255*f(0)), b=Math.round(255*f(-1/3));
+  return "#"+[r,g,b].map(v=>v.toString(16).padStart(2,"0")).join("");
+}
+let clientId="", sessionId="", roomId="", joined=false, isSynchronizer=false;
+let stream=null, lastPacketMs=0, lastSentMs=0, lastSentAnim=null;
+const me={x:WORLD_2D/2, y:WORLD_2D/2, vx:0, vy:0, health:100, score:0, name:"player", color:"#4da3ff", yaw:0, pitch:0, bank:0, altitude:90, speed:95, anim:"cruise"};
+const players=new Map(); // clientId -> {root, jet, flame, name, color, yaw, pitch, bank, altitude, speed, anim, health, score, x2d, y2d}
+function log(s){ const el=$("log"); el.textContent=(s+"\n"+el.textContent).slice(0,3000); }
+async function api(path, opts={}){ return fetch(path,{...opts, headers:{"Content-Type":"application/json","X-Client-ID":clientId,...(opts.headers||{})}}); }
+
+// ---------- Scene: playground jet ----------
+const light=new BABYLON.HemisphericLight("skyLight", new V3(0,1,0), scene);
+light.intensity=1.15; light.groundColor=new C3(0.22,0.3,0.4);
+const sun=new BABYLON.DirectionalLight("sun", new V3(-0.5,-1,0.4), scene); sun.intensity=1.6;
+function material(name,color,emissive){
+  const m=new BABYLON.StandardMaterial(name, scene);
+  m.diffuseColor=C3.FromHexString(color); m.specularColor=new C3(0.5,0.5,0.5);
+  if(emissive) m.emissiveColor=C3.FromHexString(emissive);
+  return m;
+}
+function buildJet(accentHex){
+  const jet=new BABYLON.TransformNode("jet_"+Math.random().toString(36).slice(2,7), scene);
+  const metal=material("silver_"+jet.name,"#b8c6d6"); metal.backFaceCulling=false;
+  const dark=material("dark_"+jet.name,"#243247"); dark.backFaceCulling=false;
+  const trim=material("trim_"+jet.name, accentHex); trim.backFaceCulling=false;
+  const glass=material("canopy_"+jet.name,"#173d66","#0b2036"); glass.specularPower=100;
+  function part(mesh, mat, pos){ mesh.parent=jet; mesh.material=mat; mesh.position.copyFrom(pos); return mesh; }
+  const body=part(BABYLON.MeshBuilder.CreateCylinder("fuselage",{height:7,diameterTop:0.9,diameterBottom:1.15,tessellation:32},scene),metal,new V3(0,0,0));
+  body.rotation.x=Math.PI/2;
+  const nose=part(BABYLON.MeshBuilder.CreateCylinder("nose",{height:2.8,diameterTop:0,diameterBottom:0.9,tessellation:32},scene),metal,new V3(0,0,4.9));
+  nose.rotation.x=Math.PI/2;
+  const canopy=part(BABYLON.MeshBuilder.CreateSphere("cockpit",{diameter:1,segments:24},scene),glass,new V3(0,0.48,1.7));
+  canopy.scaling.set(0.8,0.7,2.3);
+  function wing(name, points, mat){
+    const mesh=new BABYLON.Mesh(name, scene); const data=new BABYLON.VertexData();
+    data.positions=points.flat(); data.indices=[0,1,2,0,2,3]; data.normals=[];
+    BABYLON.VertexData.ComputeNormals(data.positions,data.indices,data.normals);
+    data.applyToMesh(mesh); mesh.parent=jet; mesh.material=mat; return mesh;
+  }
+  for(const side of [-1,1]){
+    wing("mainWing",[[side*0.45,-0.05,1.7],[side*5.1,-0.12,-2.3],[side*4.9,-0.12,-3.0],[side*0.45,-0.05,-1.6]],metal);
+    wing("tailWing",[[side*0.35,0.15,-2.0],[side*2.3,0.15,-3.8],[side*2.1,0.15,-4.2],[side*0.35,0.15,-3.3]],trim);
+  }
+  wing("verticalTail",[[0,0.35,-1.7],[0,2.2,-3.1],[0,2.2,-3.8],[0,0.35,-3.6]],dark);
+  const nozzle=part(BABYLON.MeshBuilder.CreateCylinder("nozzle",{height:0.7,diameterTop:0.85,diameterBottom:1,tessellation:24},scene),dark,new V3(0,0,-3.6));
+  nozzle.rotation.x=Math.PI/2;
+  const fireMat=material("exhaust_"+jet.name,"#ff9b35","#ff6515"); fireMat.disableLighting=true;
+  const flame=part(BABYLON.MeshBuilder.CreateSphere("flame",{diameter:1,segments:16},scene),fireMat,new V3(0,0,-4.7));
+  flame.scaling.set(0.6,0.6,2.2);
+  return {jet, flame};
+}
+const localJet=buildJet("#ff713d");
+const jet=localJet.jet, flame=localJet.flame;
+const glow=new BABYLON.GlowLayer("engineGlow", scene); glow.intensity=0.75; glow.addIncludedOnlyMesh(flame);
+
+// Ocean + grid
+const oceanMat=material("ocean","#247d9c"); oceanMat.specularColor=new C3(0.6,0.75,0.8);
+const waterTexture=new BABYLON.DynamicTexture("waterGrid",{width:512,height:512},scene,false);
+const ctx=waterTexture.getContext();
+ctx.fillStyle="#247d9c"; ctx.fillRect(0,0,512,512);
+ctx.strokeStyle="#388da8"; ctx.lineWidth=2;
+for(let i=0;i<=512;i+=64){ ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,512); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(512,i); ctx.stroke(); }
+waterTexture.update(); waterTexture.uScale=80; waterTexture.vScale=80; oceanMat.diffuseTexture=waterTexture;
+const ocean=BABYLON.MeshBuilder.CreateGround("ocean",{width:12000,height:12000},scene); ocean.material=oceanMat;
+const cloudMat=material("cloud","#ffffff","#424b55"); cloudMat.specularColor=C3.Black();
+const clouds=[];
+for(let i=0;i<35;i++){
+  const c=BABYLON.MeshBuilder.CreateSphere("cloud",{diameter:1,segments:8},scene);
+  c.material=cloudMat; c.scaling.set(35+Math.random()*70,8+Math.random()*12,20+Math.random()*35);
+  c.position.set((Math.random()-0.5)*2400,170+Math.random()*230,(Math.random()-0.5)*2400); clouds.push(c);
+}
+const camera=new BABYLON.FreeCamera("chaseCamera", new V3(0,90,-35), scene);
+camera.minZ=0.2; camera.maxZ=15000; camera.fov=0.9; camera.inputs.clear();
+
+// ---------- Controls ----------
+const keys=new Set();
+const controlled=new Set(["KeyW","KeyS","KeyA","KeyD","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","ShiftLeft","ShiftRight","KeyR"]);
+canvas.tabIndex=0;
+function onDown(e){ if(!controlled.has(e.code)) return; e.preventDefault(); keys.add(e.code); if(e.code==="KeyR") reset(); }
+function onUp(e){ keys.delete(e.code); }
+canvas.addEventListener("keydown", onDown);
+window.addEventListener("keyup", onUp);
+window.addEventListener("blur", ()=>keys.clear());
+canvas.addEventListener("pointerdown", ()=>canvas.focus());
+
+let yaw=0, pitch=0, bank=0, speed=95, time=0;
+function reset(){
+  const p=to3D(me.x, me.y);
+  jet.position.set(p.x, 90, p.z); yaw=pitch=bank=0; speed=95; jet.rotation.set(0,0,0);
+  camera.position.set(p.x, 95, p.z-30); camera.setTarget(jet.position.add(new V3(0,1,12)));
+  me.yaw=0; me.pitch=0; me.bank=0; me.altitude=90; me.speed=95;
+}
+reset();
+
+// ---------- Fullscreen ----------
+const wrapEl=$("wrap");
+function updateFsLabel(){
+  const on=!!document.fullscreenElement;
+  $("fsBtn").textContent=on?"⛶ Exit Fullscreen":"⛶ Fullscreen";
+  $("fsTopBtn").textContent=on?"⛶ Exit Fullscreen":"⛶ Fullscreen";
+}
+async function toggleFullscreen(){
+  try{
+    if(document.fullscreenElement) await document.exitFullscreen();
+    else await wrapEl.requestFullscreen();
+  }catch(e){ log("fullscreen: "+e.message); }
+}
+$("fsBtn").onclick=toggleFullscreen; $("fsTopBtn").onclick=toggleFullscreen;
+document.addEventListener("fullscreenchange", ()=>{ updateFsLabel(); engine.resize(); });
+window.addEventListener("resize", ()=>engine.resize());
+
+// ---------- Multiplayer ----------
+async function join(){
+  const name=$("name").value||"player";
+  const skill=Number($("skill").value||1000);
+  const disconnectSec=Number($("disconnectSec").value||60);
+  me.name=name; me.color=colorFor("me-"+name); me.score=0; me.health=100;
+  const p=to3D(me.x, me.y); jet.position.set(p.x, 90, p.z);
+  const res=await api("/api/multiplayer/join",{method:"POST", body:JSON.stringify({
+    environment_name:ENV_NAME, character_name:name, game_id:GAME_ID,
+    player_id:"demo-"+name.toLowerCase().replace(/\W+/g,"-")+"-"+Math.random().toString(36).slice(2,6),
+    display_name:name, skill:{rating:skill},
+    config:{game_id:GAME_ID, requires_matchmaking:false, requires_turn_based:false, max_players_per_room:8, min_players_per_room:1, disconnectionTime:disconnectSec, disconnection_time_sec:disconnectSec, empty_game_ttl_sec:300, authority:{scopes:["items","environment","character_state"], resource_types:["*"], allow_client_claims:true}}
+  })});
+  const data=await res.json().catch(()=>({}));
+  if(!res.ok){ log("join failed: "+res.status+" "+JSON.stringify(data)); return; }
+  clientId=data.client_id||data.clientId||""; sessionId=data.session_id||data.sessionId||"";
+  roomId=data.room_id||data.roomId||"";
+  joined=true; lastPacketMs=performance.now();
+  $("status").textContent=`Joined as ${name} • Room ${roomId} • ${GAME_ID}`;
+  $("joinBtn").disabled=true; $("leaveBtn").disabled=false;
+  log("joined: "+clientId+" room "+roomId);
+  connectStream(); sendCharacterState(true);
+}
+async function leave(){
+  joined=false;
+  try{ await api("/api/multiplayer/leave",{method:"POST", body:"{}"}); }catch(e){}
+  if(stream) stream.close(); stream=null;
+  for(const id of [...players.keys()]) removeRemote(id);
+  $("status").textContent="Left."; $("joinBtn").disabled=false; $("leaveBtn").disabled=true;
+}
+async function sendHeartbeat(){
+  if(!clientId) return;
+  const res=await api("/api/multiplayer/heartbeat",{method:"POST", body:"{}"});
+  lastPacketMs=performance.now();
+  if(res.status===403){ log("heartbeat rejected — re-join."); await leave(); }
+}
+async function sendCharacterState(force){
+  if(!clientId) return;
+  const now=performance.now(); if(!force && now-lastSentMs<50) return;
+  lastSentMs=now; lastPacketMs=now;
+  // Agreed schema: top-level ONLY clientId / position / health / metadata.
+  // Everything jet-specific lives in metadata (like the mage example).
+  const res=await api("/api/multiplayer/character-state",{method:"PATCH", body:JSON.stringify({
+    updates:[{ clientId, position:[me.x, me.y], health:me.health,
+      metadata:{ schemaVersion:1, name:me.name, color:me.color, yaw:me.yaw, pitch:me.pitch, bank:me.bank,
+        altitude:me.altitude, speed:me.speed, animationState:me.anim, score:me.score,
+        characterModelId:"jet", velocity:[me.vx, me.vy], facing: me.yaw>=0?1:-1 } }],
+    timestamp:Date.now(),
+  })});
+  if(res.status===403){ const d=await res.json().catch(()=>({})); log("character-state rejected: "+JSON.stringify(d)); await leave(); }
+}
+function handleStreamData(raw){
+  try{
+    let text=String(raw||"").trim(); if(text.startsWith("signals ")) text=text.slice("signals ".length);
+    const data=JSON.parse(text); const signals=data.signals||data;
+    const mp=signals.mp || (signals.match||signals.turnState||signals.characters||signals.items ? signals : null);
+    if(mp) applyMp(mp);
+  }catch(e){ log("stream parse: "+e); }
+}
+function connectStream(){
+  if(!sessionId) return;
+  if(stream) stream.close();
+  stream=new EventSource(`/api/multiplayer/stream?session_id=${encodeURIComponent(sessionId)}`);
+  stream.addEventListener("datastar-patch-signals",(ev)=>handleStreamData(ev.data));
+  stream.onmessage=(ev)=>handleStreamData(ev.data);
+  stream.onerror=()=>{ log("stream error — EventSource will retry"); };
+}
+function upsertRemote(id, data){
+  let p=players.get(id);
+  if(!p){
+    const built=buildJet(data.color||colorFor(id));
+    const root=built.jet;
+    p={id, x2d:WORLD_2D/2, y2d:WORLD_2D/2, health:100, score:0, name:data.name||"player", color:data.color||colorFor(id),
+       yaw:0, pitch:0, bank:0, altitude:90, speed:95, anim:"cruise", root, jet:built.jet, flame:built.flame};
+    players.set(id,p);
+  }
+  if(data.name) p.name=data.name;
+  if(typeof data.health==="number") p.health=data.health;
+  if(data.color) p.color=data.color;
+  if(typeof data.score==="number") p.score=data.score;
+  if(typeof data.yaw==="number") p.yaw=data.yaw;
+  if(typeof data.pitch==="number") p.pitch=data.pitch;
+  if(typeof data.bank==="number") p.bank=data.bank;
+  if(typeof data.altitude==="number") p.altitude=data.altitude;
+  if(typeof data.speed==="number") p.speed=data.speed;
+  if(data.anim) p.anim=data.anim;
+  return p;
+}
+function removeRemote(id){
+  const p=players.get(id); if(!p) return;
+  try{ p.root.dispose(); }catch(e){}
+  players.delete(id);
+}
+function applyMp(mp){
+  if(!mp) return;
+  if(mp.connection){
+    if(typeof mp.connection.isSynchronizer==="boolean") isSynchronizer=mp.connection.isSynchronizer;
+    if(mp.connection.roomId) roomId=mp.connection.roomId;
+  }
+  if(Array.isArray(mp.characters)){
+    for(const c of mp.characters){
+      if(!c||!c.clientId||c.clientId===clientId) continue;
+      const meta=c.metadata||{};
+      const pos=normalizePos(c.position||c.pos||meta.position);
+      const p=upsertRemote(c.clientId,{
+        name:meta.name||"player", color:meta.color||colorFor(c.clientId),
+        health:c.health??meta.health??100, score:meta.score??c.score??0,
+        yaw:typeof meta.yaw==="number"?meta.yaw:0,
+        pitch:typeof meta.pitch==="number"?meta.pitch:0,
+        bank:typeof meta.bank==="number"?meta.bank:0,
+        altitude:typeof meta.altitude==="number"?meta.altitude:90,
+        speed:typeof meta.speed==="number"?meta.speed:95,
+        anim:meta.animationState||c.animationState||"cruise",
+      });
+      p.x2d=pos.x2d; p.y2d=pos.y2d;
+      const t=to3D(pos.x2d, pos.y2d);
+      p.root.position.set(t.x, p.altitude, t.z);
+      p.root.rotation.set(-p.pitch, p.yaw, p.bank);
+      const boost=p.anim==="afterburner";
+      p.flame.scaling.set(0.6,0.6, boost?4:2.2);
+      p.flame.position.z=-3.7-p.flame.scaling.z*0.5;
+    }
+  }
+  if(mp.clientJoined) log("joined: "+mp.clientJoined.clientId);
+  if(mp.clientLeft){
+    const id=mp.clientLeft.clientId; if(id&&id!==clientId) removeRemote(id);
+    log("left: "+id);
+  }
+}
+$("joinBtn").onclick=join; $("leaveBtn").onclick=leave; $("resetBtn").onclick=reset;
+
+// ---------- Radar (circular, heading-up) ----------
+const radarCanvas=$("radarCanvas");
+const rctx=radarCanvas.getContext("2d");
+function drawRadar(){
+  const S=360, C=S/2, R=C-8;
+  rctx.clearRect(0,0,S,S);
+  // rings + cross
+  rctx.strokeStyle="rgba(120,220,255,.35)"; rctx.lineWidth=1;
+  for(const r of [R, R*0.66, R*0.33]){
+    rctx.beginPath(); rctx.arc(C,C,r,0,Math.PI*2); rctx.stroke();
+  }
+  rctx.beginPath(); rctx.moveTo(C,6); rctx.lineTo(C,S-6); rctx.moveTo(6,C); rctx.lineTo(S-6,C); rctx.stroke();
+  // N (heading)
+  rctx.fillStyle="#9fd8ff"; rctx.font="bold 18px monospace"; rctx.textAlign="center"; rctx.fillText("N", C, 24);
+  // range: 1200 world units -> R px. Other players relative, rotated by -yaw (heading-up)
+  const range=1200;
+  const drawDot=(dx,dz,color,isSelf,label)=>{
+    // right / forward in jet frame
+    const right=dx*Math.cos(yaw)-dz*Math.sin(yaw);
+    const fwd=dx*Math.sin(yaw)+dz*Math.cos(yaw);
+    let rx=right/range*R, ry=-fwd/range*R;
+    const len=Math.hypot(rx,ry);
+    if(len>R-6){ const s=(R-6)/len; rx*=s; ry*=s; }
+    const x=C+rx, y=C+ry;
+    rctx.beginPath(); rctx.arc(x,y, isSelf?7:5,0,Math.PI*2);
+    rctx.fillStyle=color; rctx.fill();
+    rctx.strokeStyle="rgba(255,255,255,.85)"; rctx.lineWidth=1; rctx.stroke();
+    if(isSelf){
+      // white triangle pointing up
+      rctx.beginPath(); rctx.moveTo(x,y-9); rctx.lineTo(x-6,y+6); rctx.lineTo(x+6,y+6); rctx.closePath();
+      rctx.fillStyle="#fff"; rctx.fill();
+    }
+    if(label){ rctx.fillStyle="#e9f7ff"; rctx.font="11px monospace"; rctx.textAlign="center"; rctx.fillText(label, x, y+16); }
+  };
+  // others
+  for(const p of players.values()){
+    const tMe=to3D(me.x, me.y), tP=to3D(p.x2d, p.y2d);
+    drawDot(tP.x-tMe.x, tP.z-tMe.z, p.color, false, p.name);
+  }
+  drawDot(0,0,"#fff",true,"YOU");
+  // legend
+  const lines=["You — white ▲"];
+  for(const p of players.values()) lines.push(`${p.name} — ${p.color} ●  ${Math.round(p.altitude)}m`);
+  $("radarLegend").textContent=lines.join("\n");
+}
+
+// ---------- Render loop (playground flight) ----------
+scene.onBeforeRenderObservable.add(()=>{
+  const dt=Math.min(engine.getDeltaTime()/1000,0.05); time+=dt;
+  const left=keys.has("KeyA")||keys.has("ArrowLeft");
+  const right=keys.has("KeyD")||keys.has("ArrowRight");
+  const up=keys.has("KeyW")||keys.has("ArrowUp");
+  const down=keys.has("KeyS")||keys.has("ArrowDown");
+  const boost=keys.has("ShiftLeft")||keys.has("ShiftRight");
+  const turn=Number(right)-Number(left);
+  const climb=Number(up)-Number(down);
+  const smooth=1-Math.exp(-5*dt);
+  bank+=(-turn*0.75-bank)*smooth;
+  pitch+=(climb*0.48-pitch)*smooth;
+  yaw+=turn*0.6*dt;
+  speed+=((boost?175:95)-speed)*(1-Math.exp(-2*dt));
+  const forward=new V3(Math.sin(yaw)*Math.cos(pitch), Math.sin(pitch), Math.cos(yaw)*Math.cos(pitch));
+  jet.position.addInPlace(forward.scale(speed*dt));
+  jet.position.y=clamp(jet.position.y,12,650);
+  // wrap XZ to 2400 range so we stay in server 0..2000
+  if(jet.position.x>1200) jet.position.x-=2400; if(jet.position.x<-1200) jet.position.x+=2400;
+  if(jet.position.z>1200) jet.position.z-=2400; if(jet.position.z<-1200) jet.position.z+=2400;
+  jet.rotation.set(-pitch, yaw, bank);
+  flame.scaling.z=(boost?4:2.2)+Math.sin(time*45)*0.2;
+  flame.position.z=-3.7-flame.scaling.z*0.5;
+  const behind=new V3(Math.sin(yaw)*27,-7,Math.cos(yaw)*27);
+  const desired=jet.position.subtract(behind);
+  camera.position.copyFrom(V3.Lerp(camera.position,desired,1-Math.exp(-4*dt)));
+  camera.setTarget(jet.position.add(forward.scale(18)).add(new V3(0,1,0)));
+  ocean.position.x=jet.position.x; ocean.position.z=jet.position.z;
+  waterTexture.uOffset=jet.position.x/12000*80; waterTexture.vOffset=jet.position.z/12000*80;
+  for(const cloud of clouds){
+    if(cloud.position.x-jet.position.x>1200) cloud.position.x-=2400;
+    if(cloud.position.x-jet.position.x<-1200) cloud.position.x+=2400;
+    if(cloud.position.z-jet.position.z>1200) cloud.position.z-=2400;
+    if(cloud.position.z-jet.position.z<-1200) cloud.position.z+=2400;
+  }
+  // sync me -> server 2D
+  const c2=to2D(jet.position.x, jet.position.z);
+  me.x=c2.x; me.y=c2.y; me.yaw=yaw; me.pitch=pitch; me.bank=bank; me.altitude=jet.position.y; me.speed=speed;
+  me.vx=forward.x*speed; me.vy=forward.z*speed;
+  me.anim=boost?"afterburner":"cruise";
+  // HUD
+  $("hud").textContent=
+    "JET FLIGHT\n"+
+    "W/S or ↑/↓  Climb / descend\n"+
+    "A/D or ←/→  Bank / turn\n"+
+    "Shift       Afterburner\n"+
+    "R           Reset\n\n"+
+    `Speed    ${Math.round(speed*3.6)} km/h\n`+
+    `Altitude ${Math.round(jet.position.y)} m\n`+
+    `Engine   ${boost?"AFTERBURNER":"CRUISE"}\n`+
+    `Players  ${players.size+(joined?1:0)} • ${GAME_ID}\n`+
+    `Yaw      ${Math.round(yaw*180/Math.PI)}°  Pitch ${Math.round(pitch*180/Math.PI)}°`;
+  drawRadar();
+  if(joined){
+    const animChanged=me.anim!==lastSentAnim;
+    if(animChanged){ lastSentAnim=me.anim; sendCharacterState(true); }
+    else if(performance.now()-lastPacketMs>10000) sendHeartbeat();
+    else sendCharacterState(false);
+  }
+});
+engine.runRenderLoop(()=>scene.render());
+</script>
+</body>
+</html>

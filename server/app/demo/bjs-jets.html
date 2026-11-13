@@ -31,7 +31,7 @@
 </head>
 <body>
 <div id="topbar">
-  <h1>✈️ BJS JETS</h1>
+  <h1>✈ BJS JETS</h1>
   <label>Name <input id="name" value="Dale"/></label>
   <label>Skill <input id="skill" type="number" value="1000"/></label>
   <label>Timeout <input id="disconnectSec" type="number" value="60"/></label>
@@ -67,6 +67,26 @@ const V3 = BABYLON.Vector3, C3 = BABYLON.Color3, clamp = BABYLON.Scalar.Clamp;
 // ---------- Multiplayer — own game id, NOT top-down / babylon ----------
 const GAME_ID = "bjs-jets-demo";
 const ENV_NAME = "bjs-jets-demo";
+const CHARACTER_SCHEMA = {
+  version: 1,
+  fields: {
+    position: { type: "vec2", required: true, authority: "client", semantic: "position" },
+    health: { type: "int", required: true, min: 0, max: 100, authority: "client", semantic: "health" },
+    score: { type: "int", authority: "server", default: 0, min: 0, semantic: "score" },
+    name: { type: "string", authority: "client", semantic: "name" },
+    color: { type: "string", authority: "client" },
+    yaw: { type: "number", authority: "client" },
+    pitch: { type: "number", authority: "client" },
+    bank: { type: "number", authority: "client" },
+    altitude: { type: "number", authority: "client" },
+    speed: { type: "number", authority: "client" },
+    anim: { type: "string", authority: "client" },
+    velocity: { type: "vec2", authority: "client" },
+  },
+};
+// Effective schema: ours, unless the server answers 409 with the stored
+// schema for this game_id — then join() retries once with that stored schema.
+let effectiveSchema = CHARACTER_SCHEMA;
 const WORLD_2D = 2000;      // server 2D space
 const JET_RANGE = 2400;     // Babylon XZ: -1200..+1200 maps to 0..2000
 function to3D(x2d, y2d){ return { x:(x2d/WORLD_2D-0.5)*JET_RANGE, z:(y2d/WORLD_2D-0.5)*JET_RANGE }; }
@@ -197,13 +217,23 @@ async function join(){
   const disconnectSec=Number($("disconnectSec").value||60);
   me.name=name; me.color=colorFor("me-"+name); me.score=0; me.health=100;
   const p=to3D(me.x, me.y); jet.position.set(p.x, 90, p.z);
-  const res=await api("/api/multiplayer/join",{method:"POST", body:JSON.stringify({
+  const postJoin=(schema)=>api("/api/multiplayer/join",{method:"POST", body:JSON.stringify({
     environment_name:ENV_NAME, character_name:name, game_id:GAME_ID,
     player_id:"demo-"+name.toLowerCase().replace(/\W+/g,"-")+"-"+Math.random().toString(36).slice(2,6),
     display_name:name, skill:{rating:skill},
-    config:{game_id:GAME_ID, requires_matchmaking:false, requires_turn_based:false, max_players_per_room:8, min_players_per_room:1, disconnectionTime:disconnectSec, disconnection_time_sec:disconnectSec, empty_game_ttl_sec:300, authority:{scopes:["items","environment","character_state"], resource_types:["*"], allow_client_claims:true}}
+    config:{game_id:GAME_ID, requires_matchmaking:false, requires_turn_based:false, max_players_per_room:8, min_players_per_room:1, disconnectionTime:disconnectSec, disconnection_time_sec:disconnectSec, empty_game_ttl_sec:300, authority:{scopes:["items","environment","character_state"], resource_types:["*"], allow_client_claims:true}, character_schema:schema}
   })});
-  const data=await res.json().catch(()=>({}));
+  let res=await postJoin(effectiveSchema);
+  let data=await res.json().catch(()=>({}));
+  if(res.status===409){
+    // 409: retry once with the server-stored schema.
+    const stored=data.character_schema||data.characterSchema||(data.detail&& (data.detail.character_schema||data.detail.characterSchema));
+    if(stored){
+      effectiveSchema=stored;
+      res=await postJoin(effectiveSchema);
+      data=await res.json().catch(()=>({}));
+    }
+  }
   if(!res.ok){ log("join failed: "+res.status+" "+JSON.stringify(data)); return; }
   clientId=data.client_id||data.clientId||""; sessionId=data.session_id||data.sessionId||"";
   roomId=data.room_id||data.roomId||"";
@@ -230,13 +260,12 @@ async function sendCharacterState(force){
   if(!clientId) return;
   const now=performance.now(); if(!force && now-lastSentMs<50) return;
   lastSentMs=now; lastPacketMs=now;
-  // Agreed schema: top-level ONLY clientId / position / health / metadata.
-  // Everything jet-specific lives in metadata (like the mage example).
+  // Protocol v1: {clientId, state:{...}}. Never send score (server-authoritative).
   const res=await api("/api/multiplayer/character-state",{method:"PATCH", body:JSON.stringify({
-    updates:[{ clientId, position:[me.x, me.y], health:me.health,
-      metadata:{ schemaVersion:1, name:me.name, color:me.color, yaw:me.yaw, pitch:me.pitch, bank:me.bank,
-        altitude:me.altitude, speed:me.speed, animationState:me.anim, score:me.score,
-        characterModelId:"jet", velocity:[me.vx, me.vy], facing: me.yaw>=0?1:-1 } }],
+    updates:[{ clientId, state:{
+      position:[me.x, me.y], health:me.health, name:me.name, color:me.color,
+      yaw:me.yaw, pitch:me.pitch, bank:me.bank, altitude:me.altitude, speed:me.speed,
+      anim:me.anim, velocity:[me.vx, me.vy] } }],
     timestamp:Date.now(),
   })});
   if(res.status===403){ const d=await res.json().catch(()=>({})); log("character-state rejected: "+JSON.stringify(d)); await leave(); }
@@ -292,17 +321,17 @@ function applyMp(mp){
   if(Array.isArray(mp.characters)){
     for(const c of mp.characters){
       if(!c||!c.clientId||c.clientId===clientId) continue;
-      const meta=c.metadata||{};
-      const pos=normalizePos(c.position||c.pos||meta.position);
+      const st=c.state||{};
+      const pos=normalizePos(st.position);
       const p=upsertRemote(c.clientId,{
-        name:meta.name||"player", color:meta.color||colorFor(c.clientId),
-        health:c.health??meta.health??100, score:meta.score??c.score??0,
-        yaw:typeof meta.yaw==="number"?meta.yaw:0,
-        pitch:typeof meta.pitch==="number"?meta.pitch:0,
-        bank:typeof meta.bank==="number"?meta.bank:0,
-        altitude:typeof meta.altitude==="number"?meta.altitude:90,
-        speed:typeof meta.speed==="number"?meta.speed:95,
-        anim:meta.animationState||c.animationState||"cruise",
+        name:st.name||"player", color:st.color||colorFor(c.clientId),
+        health:st.health??100, score:st.score??0,
+        yaw:typeof st.yaw==="number"?st.yaw:0,
+        pitch:typeof st.pitch==="number"?st.pitch:0,
+        bank:typeof st.bank==="number"?st.bank:0,
+        altitude:typeof st.altitude==="number"?st.altitude:90,
+        speed:typeof st.speed==="number"?st.speed:95,
+        anim:st.anim||"cruise",
       });
       p.x2d=pos.x2d; p.y2d=pos.y2d;
       const t=to3D(pos.x2d, pos.y2d);
