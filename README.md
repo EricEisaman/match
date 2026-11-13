@@ -14,11 +14,11 @@
 
 > **One join shape serves every game.**
 >
-> MATCH is an open-source multiplayer backend for small-to-medium realtime and turn-based games. Clients `join` once with a `GameSessionConfig`, then send character state, item state, custom state, and turn actions over REST — and receive the whole game over a single Server-Sent Events (SSE) stream. The server is authoritative for rooms, turns, items, and game data from the first join.
+> MATCH is an open-source multiplayer backend for small-to-medium realtime and turn-based games. Clients `join` once with a `GameSessionConfig` — including a `character_schema` that declares the shape of per-player state — then send character state, item state, custom state, and turn actions over REST — and receive the whole game over a single Server-Sent Events (SSE) stream. The server is authoritative for rooms, turns, items, and game data from the first join.
 
-No WebSockets to manage. No background timer loop. No per-game server code for the common cases — tic-tac-toe, top-down collectors, lobby games, and turn-based board games all speak the same protocol.
+No WebSockets to manage. No background timer loop. No per-game server code for the common cases — tic-tac-toe, top-down collectors, 3D third-person collectors, lobby games, and turn-based board games all speak the same protocol.
 
-**Live demos in this repo:** `GET /tic-tac-toe` · `GET /top-down` · `GET /demo/{name}`
+**Live demos in this repo:** `GET /tic-tac-toe` · `GET /top-down` · `GET /babylon` · `GET /demo/{name}`
 
 ---
 
@@ -30,6 +30,7 @@ No WebSockets to manage. No background timer loop. No per-game server code for t
 - [How it works — architecture](#how-it-works--architecture)
 - [Project structure](#project-structure)
 - [API Reference](#api-reference)
+- [Character state — schema-declared](#character-state--schema-declared)
 - [Client protocol — the 60-second version](#client-protocol--the-60-second-version)
 - [How Matching Works](#how-matching-works)
 - [Turn-Based or Not — Choosing a Mode](#turn-based-or-not--choosing-a-mode)
@@ -57,6 +58,7 @@ Most multiplayer tutorials stop at “echo positions to everyone.” Real games 
 | Late joiners | Full bootstrap snapshot on `GET /stream` — characters, items, room, turn state |
 | Idle games leaking memory | Empty-game data deleted lazily after `empty_game_ttl_sec` (default 5 min) |
 | One backend, many games | `game_id` + `GameSessionConfig` selects matchmaking, turns, authority, TTLs |
+| Character state that cannot drift | `character_schema`: every game declares its per-player fields, types, and who may set them — the server validates, drops server-owned fields from client patches, and rejects legacy shapes |
 
 **Design principles**
 
@@ -64,6 +66,7 @@ Most multiplayer tutorials stop at “echo positions to everyone.” Real games 
 2. **Event-driven, never timers.** No `sleep`, no background sweeper. Disconnect and empty-game cleanup run lazily when the *next* packet from *any* client arrives. This makes behaviour deterministic, testable, and cheap on serverless / Render free tiers.
 3. **One protocol.** `join` → `stream` → `character-state` / `item-state` / `custom-state` / `turn/action`. If you can `fetch()`, you can multiplayer.
 4. **Boring transport.** REST for client → server, SSE for server → client. Works through proxies, load balancers, and browsers with no WebSocket upgrade.
+5. **Declared, not guessed, character state.** There is no universal `pos` / `health` / `metadata` shape. Each `game_id` declares its fields in `character_schema`; anything undeclared is rejected, and anything server-owned is dropped from client patches.
 
 ---
 
@@ -72,13 +75,14 @@ Most multiplayer tutorials stop at “echo positions to everyone.” Real games 
 - **Skill-aware matchmaking** — rating + widening tolerance, FIFO fairness, `min_players_per_room` / `max_players_per_room`
 - **Direct + private rooms** — `room_id` / `room_code`, `visibility: public | private`
 - **Turn-based engine** — server-validated actions, pass / resign, draw / win, opponent-left handling
-- **Realtime engine** — character-state broadcast, dirty filtering, freshness tracking
+- **Realtime engine** — schema-validated character-state broadcast, dirty filtering, freshness tracking
+- **Schema-declared character state** — `character_schema` per `game_id`: types, required, defaults, bounds, client vs server authority, `409` on mismatch, `dropped_server_fields` on client patches that try to set server fields
 - **Item authority** — env authority + per-item owners, claim / release, exactly-once collections
-- **Server-spawned game data** — e.g. top-down gems: 24 live, respawn 1 per collection, same field for every player
+- **Server-spawned game data** — e.g. gem games: 24 live gems, respawn 1 per collection, same field for every player, server-authoritative score on collection
 - **Disconnect handling** — per-client `disconnection_time_sec`, heartbeat endpoint, `403 disconnected: timeout`, failover
-- **Empty-game cleanup** — game data deleted after 5 min empty (lazy, on next packet)
+- **Empty-game cleanup** — game data deleted after 5 min empty (lazy, on next packet), including the stored character schema
 - **Custom state & effects** — opaque per-room `custom` + `effects-state` for game-specific rules
-- **Demos** — turn-based tic-tac-toe and realtime top-down, both against the same API
+- **Demos** — turn-based tic-tac-toe, realtime top-down, and 3D third-person Babylon, all against the same API
 - **Capabilities endpoint** — `GET /api/v1/capabilities` for clients to feature-detect
 
 ---
@@ -98,7 +102,8 @@ Open:
 
 - http://localhost:8000/ — API index
 - http://localhost:8000/tic-tac-toe — turn-based demo
-- http://localhost:8000/top-down — realtime demo
+- http://localhost:8000/top-down — realtime 2D demo
+- http://localhost:8000/babylon — realtime 3D third-person demo
 
 ### 2. Join a game (realtime, no matchmaking)
 
@@ -118,7 +123,17 @@ curl -s -X POST http://localhost:8000/api/multiplayer/join \
       "max_players_per_room": 8,
       "min_players_per_room": 1,
       "disconnection_time_sec": 60,
-      "empty_game_ttl_sec": 300
+      "empty_game_ttl_sec": 300,
+      "character_schema": {
+        "version": 1,
+        "fields": {
+          "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+          "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+          "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+          "name": {"type": "string", "authority": "client", "semantic": "name"},
+          "color": {"type": "string", "authority": "client"}
+        }
+      }
     }
   }'
 ```
@@ -133,9 +148,12 @@ Response (abridged):
   "room_id": "3224f87452ae",
   "game_id": "top-down-demo",
   "match_status": "ready",
-  "disconnection_time_sec": 60.0
+  "disconnection_time_sec": 60.0,
+  "character_schema": { "version": 1, "fields": { "...": "..." }, "allow_unknown": false }
 }
 ```
+
+The first join for a `game_id` stores that schema. A later join declaring a different schema gets `409` with `{"error": "character_schema_mismatch", "character_schema": <stored>}` — rejoin once with the stored schema. To change a schema, use a new `game_id` or wait for the empty-game TTL to clear the old game data. See [Character state](#character-state--schema-declared).
 
 ### 3. Stream the game
 
@@ -143,17 +161,19 @@ Response (abridged):
 curl -N "http://localhost:8000/api/multiplayer/stream?session_id=9f8e7d6c5b4a3921"
 ```
 
-The first SSE event is a full bootstrap: `connection`, `clients`, `characters`, `items`, `room`, `match`, `turnState`. Every later event is a patch: `item-state-update`, `character-state-update`, `client-joined`, `client-left`, `synchronizer-changed`, `env-item-authority-changed`, `game-over`, and so on.
+The first SSE event is a full bootstrap: `connection`, `clients`, `characters`, `items`, `room`, `match`, `turnState`, plus the effective `character_schema`. Every later event is a patch: `item-state-update`, `character-state-update`, `client-joined`, `client-left`, `synchronizer-changed`, `env-item-authority-changed`, `game-over`, and so on.
 
 ### 4. Send input
 
 ```bash
-# Move (realtime)
+# Move (realtime) — schema shape: {clientId, state: {...}}. Only client-owned fields.
+# NEVER send score here: it is server-authoritative and would be dropped.
 curl -s -X PATCH http://localhost:8000/api/multiplayer/character-state \
   -H "Content-Type: application/json" -H "X-Client-ID: a1b2c3d4" \
-  -d '{"updates":[{"clientId":"a1b2c3d4","pos":[120,340],"health":100}],"timestamp":1710000000000}'
+  -d '{"updates":[{"clientId":"a1b2c3d4","state":{"position":[120,340],"health":100,"name":"Billy","color":"#4da3ff"}}],"timestamp":1710000000000}'
 
-# Collect a gem (exactly-once)
+# Collect a gem (exactly-once). The server increments the server-authoritative
+# score and broadcasts the updated character state with source "server".
 curl -s -X PATCH http://localhost:8000/api/multiplayer/item-state \
   -H "Content-Type: application/json" -H "X-Client-ID: a1b2c3d4" \
   -d '{"updates":[],"collections":[{"instanceId":"top-down-demo:gem-1","collectedByClientId":"a1b2c3d4","environment":"top-down-demo"}],"timestamp":1710000000000}'
@@ -164,6 +184,8 @@ curl -s -X POST http://localhost:8000/api/multiplayer/heartbeat \
 ```
 
 > All client → server calls after `join` carry `X-Client-ID: <client_id>`. The `stream` call carries `?session_id=<session_id>` instead.
+>
+> The old shape — top-level `pos` / `position` / `health` / `score` / `metadata` / `velocity` / `facing` on a character update — is rejected with `422`. Send everything inside `state` and declare it in `character_schema`.
 
 ### 5. Join a turn-based game (tic-tac-toe)
 
@@ -181,12 +203,13 @@ curl -s -X POST http://localhost:8000/api/multiplayer/join \
       "requires_turn_based": true,
       "max_players_per_room": 2,
       "min_players_per_room": 2,
-      "turn": {"max_turns": 9, "allow_pass": false, "allow_resign": true}
+      "turn": {"max_turns": 9, "allow_pass": false, "allow_resign": true},
+      "character_schema": {"version": 1, "fields": {}}
     }
   }'
 ```
 
-Then play with `POST /api/multiplayer/turn/action` — see [Turn-Based or Not](#turn-based-or-not--choosing-a-mode).
+Tic-tac-toe sends no character state, so its schema is empty (`fields: {}`). Omitting `character_schema` entirely means the same thing: an empty schema. Then play with `POST /api/multiplayer/turn/action` — see [Turn-Based or Not](#turn-based-or-not--choosing-a-mode).
 
 ---
 
@@ -197,7 +220,8 @@ Then play with `POST /api/multiplayer/turn/action` — see [Turn-Based or Not](#
   Browser / Client  │  join()                      │
   ───────────────►  │  POST /api/multiplayer/join │
                     │  → room + authority +       │
-                    │    server game data         │
+                    │    server game data +       │
+                    │    character_schema         │
                     └──────────────┬─────────────┘
                                    │ bootstrap
                     ┌──────────────▼─────────────┐
@@ -218,6 +242,7 @@ Then play with `POST /api/multiplayer/turn/action` — see [Turn-Based or Not](#
                     │  MultiplayerRegistry       │
                     │  clients · rooms · authority│
                     │  character_cache · item_cache│
+                    │  game_character_schemas     │
                     │  TurnManager · Matchmaker  │
                     │  DirtyFilter · Freshness   │
                     │  ────────────────────────── │
@@ -232,7 +257,8 @@ Then play with `POST /api/multiplayer/turn/action` — see [Turn-Based or Not](#
 **Key invariants**
 
 - The server never trusts a client about *who* may act, *whose* turn it is, or *whether* an item exists. It validates and then broadcasts.
-- The first packet for a game creates the game data. The last client leaving starts a 5-minute grace clock. The next packet after the clock expires deletes the data.
+- The server never trusts a client about the *shape* of character state. The first join for a `game_id` declares it; every patch is validated against it.
+- The first packet for a game creates the game data. The last client leaving starts a 5-minute grace clock. The next packet after the clock expires deletes the data — including the stored character schema.
 - Every packet is a “tick.” There is no wall-clock loop.
 
 ### Project structure
@@ -246,14 +272,16 @@ match/
 │   └── app/
 │       ├── main.py               # FastAPI app, demos, /api/multiplayer router, registry glue
 │       ├── multiplayer/
-│       │   ├── protocol.py       # GameSessionConfig, JoinRequest/Response, signals, validation
+│       │   ├── protocol.py       # GameSessionConfig, CharacterSchema, JoinRequest/Response, signals, validation
 │       │   ├── authority.py      # AuthorityManager — env + per-item ownership, failover
 │       │   ├── matchmaking.py    # Matchmaker — queues, fingerprint, skill tolerance
 │       │   ├── turns.py          # TurnManager — phases, order, pass/resign, win/draw
 │       │   └── ...               # DirtyFilter, FreshnessMatrix, SkillProvider
 │       └── demo/
-│           ├── tic-tac-toe.html  # turn-based demo
-│           └── top-down.html     # realtime demo (server-spawned gems)
+│           ├── tic-tac-toe.html  # turn-based demo (empty character schema)
+│           ├── top-down.html     # realtime 2D demo (server-spawned gems, server score)
+│           ├── babylon.html      # realtime 3D third-person demo (same gem protocol, yaw + anim)
+│           └── hulk.glb          # model loaded by babylon.html
 └── extension/
     └── manifest.json
 ```
@@ -266,13 +294,13 @@ match/
 
 Base: `https://<your-host>/api/multiplayer`
 
-All timestamps are **milliseconds since epoch** (`_now_ms()`). All client → server calls after `join` require `X-Client-ID`. Errors are FastAPI `HTTPException` JSON: `{"detail": "..."}`.
+All timestamps are **milliseconds since epoch** (`_now_ms()`). All client → server calls after `join` require `X-Client-ID`. Errors are FastAPI `HTTPException` JSON: `{"detail": "..."}`. Character-state errors use `422` for malformed / undeclared / legacy shapes and `409` for schema mismatch on join (see [Character state](#character-state--schema-declared)).
 
 ### Session & matchmaking
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/join` | Create a client, assign room / queue, register authority, ensure server game data. Returns `client_id`, `session_id`, `is_synchronizer`, `room_id`, `disconnection_time_sec`. |
+| `POST` | `/join` | Create a client, assign room / queue, register authority, ensure server game data, store or check `character_schema`. Returns `client_id`, `session_id`, `is_synchronizer`, `room_id`, `disconnection_time_sec`, `character_schema`. |
 | `POST` | `/leave` | Remove client, fail over synchronizer / authority, start empty-game clock if env is now empty. |
 | `POST` | `/heartbeat` | Explicit keep-alive. Touches `last_seen_ms`, sweeps expired + empty games. Returns `403` if already evicted. |
 | `POST` | `/matchmaking/cancel` | Remove client from queue. |
@@ -284,8 +312,8 @@ All timestamps are **milliseconds since epoch** (`_now_ms()`). All client → se
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PATCH` | `/character-state` | Broadcast position / health / score / custom metadata for one or more clients. Server relays, does not simulate physics. |
-| `PATCH` | `/item-state` | `updates` (move / spawn — authority-gated) + `collections` (exactly-once, any player). For server-spawned gems, updates are dropped; only collections are accepted. |
+| `PATCH` | `/character-state` | Broadcast schema-declared per-player state for one or more clients. See [Character state](#character-state--schema-declared). Server validates against the game’s schema, merges patches into the stored full state, drops server-owned fields from client patches, and broadcasts the merged full state. |
+| `PATCH` | `/item-state` | `updates` (move / spawn — authority-gated) + `collections` (exactly-once, any player). For server-spawned gems, updates are dropped; only collections are accepted, and each collection respawns one gem + increments the collector’s server-authoritative score. |
 | `PATCH` | `/item-authority-claim` | Claim authority over a single item (if `allow_client_claims`). |
 | `PATCH` | `/item-authority-release` | Release a claim. |
 | `PATCH` | `/custom-state` | Opaque per-room `custom` dict — game-specific rules, scores, timers, flags. |
@@ -307,7 +335,8 @@ All timestamps are **milliseconds since epoch** (`_now_ms()`). All client → se
 | `GET` | `/api/v1/capabilities` | Feature flags the client can detect (`disconnectionTime`, `heartbeat`, `turns`, etc.). |
 | `GET` | `/` | API index / health. |
 | `GET` | `/tic-tac-toe` | Turn-based demo. |
-| `GET` | `/top-down` | Realtime demo (also at `/demo/top-down`). |
+| `GET` | `/top-down` | Realtime 2D demo (also at `/demo/top-down`). |
+| `GET` | `/babylon` | Realtime 3D third-person demo (also at `/demo/babylon`, `/babylon.html`, `/demo/babylon.html`). Serves `babylon.html` + `hulk.glb`. |
 | `GET` | `/demo/{name}` | Any demo in `server/app/demo/{name}.html`. |
 | `GET` | `/extension/manifest.json` | Extension manifest. |
 
@@ -347,6 +376,16 @@ All timestamps are **milliseconds since epoch** (`_now_ms()`). All client → se
       "resource_types": ["*"],
       "allow_client_claims": true
     },
+    "character_schema": {
+      "version": 1,
+      "fields": {
+        "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+        "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+        "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+        "name": {"type": "string", "authority": "client", "semantic": "name"},
+        "color": {"type": "string", "authority": "client"}
+      }
+    },
     "disconnection_time_sec": 60,
     "empty_game_ttl_sec": 300,
     "custom_rules": {},
@@ -355,7 +394,7 @@ All timestamps are **milliseconds since epoch** (`_now_ms()`). All client → se
 }
 ```
 
-`environment_name` defaults to `game_id` if omitted. `config` is parsed by `GameSessionConfig.from_payload()` and accepts flat aliases (`maxPlayersPerRoom`, `disconnectionTime`, `emptyGameTtlSec`, …) as well as nested shapes.
+`environment_name` defaults to `game_id` if omitted. `config` is parsed by `GameSessionConfig.from_payload()` and accepts flat aliases (`maxPlayersPerRoom`, `disconnectionTime`, `emptyGameTtlSec`, …) as well as nested shapes. Omitting `character_schema` declares the empty schema (no character state — correct for tic-tac-toe).
 
 ### `GET /stream` — SSE wire format
 
@@ -368,7 +407,7 @@ data: signals {"mp": {"connection": {...}, "characters": [...], "items": {...}, 
 
 Clients should handle two forms:
 
-- **Bootstrap** (first event): full snapshot — `connection`, `clients`, `characters`, `items.updates`, `room`, `custom`, `turnState`, `match`.
+- **Bootstrap** (first event): full snapshot — `connection`, `clients`, `characters`, `items.updates`, `room`, `custom`, `turnState`, `match`, `character_schema`.
 - **Patch** (later events): a single signal name — `item-state-update`, `character-state-update`, `client-joined`, `client-left`, `synchronizer-changed`, `env-item-authority-changed`, `item-authority-changed`, `game-over`, `matchmaking-queued`, etc.
 
 Demo clients parse with:
@@ -377,6 +416,46 @@ Demo clients parse with:
 const stream = new EventSource(`/api/multiplayer/stream?session_id=${sessionId}`);
 stream.addEventListener("datastar-patch-signals", (ev) => handleStreamData(ev.data));
 stream.onmessage = (ev) => handleStreamData(ev.data);
+```
+
+### `PATCH /character-state` — shape
+
+```jsonc
+{
+  "updates": [
+    {
+      "clientId": "a1b2c3d4",
+      "state": {
+        "position": [120.5, 340.0],
+        "health": 100,
+        "name": "Billy",
+        "color": "#4da3ff"
+        // NEVER "score" here — it is server-authoritative (see below)
+      }
+      // "timestamp" is accepted but ignored; the server stamps receipt time.
+      // "source" is accepted but ignored; the caller decides source.
+    }
+  ],
+  "timestamp": 1710000000000 // accepted but ignored
+}
+```
+
+Response:
+
+```jsonc
+{
+  "ok": true,
+  "accepted": [{ "clientId": "a1b2c3d4", "state": { "...": "merged full state" }, "source": "client", "timestamp": 1710000000123 }],
+  "dropped_server_fields": { "a1b2c3d4": ["score"] }, // only when the patch tried to set server fields
+  "server_timestamp": 1710000000123
+}
+```
+
+Broadcast characters (bootstrap + `character-state-update`) are full merged states:
+
+```jsonc
+{ "clientId": "a1b2c3d4", "state": { "position": [120.5, 340.0], "health": 100, "score": 3, "name": "Billy", "color": "#4da3ff" }, "source": "client" }
+{ "clientId": "a1b2c3d4", "state": { "position": [120.5, 340.0], "health": 100, "score": 4, "name": "Billy", "color": "#4da3ff" }, "source": "server" }
 ```
 
 ### `PATCH /item-state` — shape
@@ -407,15 +486,139 @@ stream.onmessage = (ev) => handleStreamData(ev.data);
 - `instanceId` should be namespaced: `<environment>:<local-id>`. Bare ids bind to the sender’s env on first sight.
 - `updates` are **authority-gated** — non-owners are silently dropped (per spec §7.5). No error, no broadcast.
 - `collections` are **any-player, exactly-once** — the first valid collection wins; later duplicates are dropped; a collected item cannot be resurrected by a stale update (except by the env authority respawning it, or by the server respawning a gem).
-- For `top-down-demo`, the server owns gems: client `updates` for gems are dropped, `collections` trigger a server respawn in the same broadcast.
+- For gem games (`top-down-demo`, `babylon-demo`), the server owns gems: client `updates` for gems are dropped, `collections` trigger a server respawn + a server-authoritative score increment in the same broadcast.
+
+---
+
+## Character state — schema-declared
+
+### Why a schema?
+
+Before the schema, every game invented its own top-level character shape — `pos` here, `position` there, `metadata: {health, name}` somewhere else — and the server relayed whatever it got. A client that sent `score` could set its own score. A client that sent a new field could break every other client’s renderer. The schema fixes that: **one declared shape per `game_id`, validated by the server, with authority per field.**
+
+Rules in one paragraph: the only universal top-level character field is `clientId`. Everything else lives inside `state` and must be declared in `config.character_schema` on join. The first join for a `game_id` stores the schema; a later join with a different schema gets `409` + the stored schema. Patches are partial — a client may send one field at a time — and `required` is enforced on the merged full state, not on the patch. Client patches that include a server-owned field have that field dropped (reported in `dropped_server_fields`), never broadcast. Unknown fields are rejected (`422`) unless the schema opts into `allow_unknown`. Legacy top-level shapes (`position`, `health`, `velocity`, `score`, `metadata`, `pos`, … outside `state`) are rejected outright (`422`).
+
+### Declaring a schema
+
+```jsonc
+{
+  "version": 1,                       // part of the schema identity: same fields, different version = mismatch (409)
+  "allow_unknown": false,             // default false = closed schema; true = relay unknown fields unvalidated (prototyping only)
+  "fields": {                         // alias: "properties" is also accepted
+    "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+    "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+    "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+    "name": {"type": "string", "authority": "client", "semantic": "name"}
+  }
+}
+```
+
+| Field key | Meaning |
+|---|---|
+| `type` | Required. One of `string`, `int`, `number`, `bool`, `enum`, `vec2`, `vec3`. |
+| `required` | Default `false`. Enforced on the merged full state, not on a patch. |
+| `default` | Value filled in when a field is missing from the merged state. `null` means “no default” — `null` is never a valid value for any field type. |
+| `min` / `max` | Numeric bounds for `int` / `number`, per-component bounds for `vec2` / `vec3`, length bounds for `string`. Aliases: `min_value` / `minimum`, `max_value` / `maximum`. Not meaningful for `bool` / `enum`. |
+| `values` | Only for `enum`. Non-empty list of string / number values. Alias: `enum_values`. |
+| `authority` | `"client"` (default) or `"server"`. Alias: `"server_only": true` means `authority: "server"`. |
+| `semantic` | Optional hint for generic tools (lobby, spectator, debug UI): e.g. `"position"`, `"health"`, `"score"`, `"name"`. Free-form string, not validated beyond non-empty. |
+
+Limits: at most 64 fields per schema, at most 64 keys and 8192 bytes per patch. Field names may not be the reserved `clientId`, `state`, `timestamp`, `source`.
+
+Validation / normalization: `number` becomes `float`; `vec2` / `vec3` become lists of floats of exactly 2 / 3 numbers; `int` must be a real integer (booleans are rejected); `enum` values are not coerced; `bool` must be a real boolean; `string` length is checked against `min` / `max` when set.
+
+### Who may set what — client vs server authority
+
+| Authority | Who sets it | Client patch containing it | Example |
+|---|---|---|---|
+| `client` | Any client, for its own `clientId` | Accepted, validated, broadcast | `position`, `health`, `name`, `yaw`, `anim` |
+| `server` | Server code only (internal server-set path) | Dropped, listed in `dropped_server_fields`, never broadcast | `score` in the gem games |
+
+The canonical server-owned field today is `score` in the gem games: the client never sends it, never increments it locally. On collection the server increments it through the server-set path and broadcasts the updated full state with `source: "server"`. That broadcast is the only way the client learns its new score. The synchronizer is still a client — it must go through `validate_client_patch` like everyone else.
+
+`timestamp` and `source` from the client are ignored: the server stamps receipt time, and the caller decides `source` (`"client"` for client patches, `"server"` for server-set patches).
+
+### First join wins, two enforcements
+
+1. **Registry (`409`):** one stored schema per `game_id`, regardless of room / `room_code`. A later join with a different schema (fields, `version`, or `allow_unknown` differ) gets `409` + the stored schema and creates no session, no room, no synchronizer. The demos retry once with the stored schema.
+2. **Matchmaking fingerprint:** the schema’s canonical hash is part of `GameSessionConfig.fingerprint()`, so two clients that declared different schemas never matchmake together in the first place.
+
+To change a schema, use a new `game_id` or wait for the empty-game TTL to clear the old game data (empty-game deletion deletes the stored schema with the game).
+
+### The three shipped schemas
+
+**Top-down** (`top-down-demo`) — 2D realtime collector:
+
+```jsonc
+{ "version": 1, "fields": {
+  "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+  "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+  "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+  "name": {"type": "string", "authority": "client", "semantic": "name"},
+  "color": {"type": "string", "authority": "client"}
+} }
+```
+
+**Babylon** (`babylon-demo`) — 3D third-person collector, same gem protocol, plus orientation / animation:
+
+```jsonc
+{ "version": 1, "fields": {
+  "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+  "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+  "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+  "name": {"type": "string", "authority": "client", "semantic": "name"},
+  "color": {"type": "string", "authority": "client"},
+  "yaw": {"type": "number", "authority": "client"},
+  "anim": {"type": "string", "authority": "client"}
+} }
+```
+
+Babylon and top-down are different `game_id`s with different schemas and different gem fields (`babylon-demo:gem-N` vs `top-down-demo:gem-N`) — they never share gems or character state. Babylon is a 3D third-person game, not a top-down game; it shares the gem mechanic, not the camera.
+
+**Tic-tac-toe** (`tic-tac-toe`) — turn-based, no character state:
+
+```jsonc
+{ "version": 1, "fields": {} }
+```
+
+### Client handling — partial-safe, own-state is the score channel
+
+Server broadcasts are full merged states, but a client must still handle them as if they could be partial: only fields present in a broadcast overwrite the stored value; missing fields keep their previous value. A server-only score broadcast is the one case where this matters in practice — the demos’ `applySelfCharacter()` takes `score` (and `health`) from their own entry and never overwrites their own position from their own echo, and `upsertRemote()` only overwrites remote fields actually present.
+
+Do not do what the old demos did:
+
+```js
+// WRONG (old demos): local score increment on collection — double-counts,
+// because the server already incremented it and will broadcast it.
+me.score += 1;
+
+// WRONG (old demos): sending score, metadata, velocity, facing, characterModelId
+updates: [{ clientId, position: [x, y], score: me.score, metadata: { health, name } }]
+// → 422 (legacy shape) and/or dropped_server_fields: ["score"]
+
+// RIGHT: send only client-owned fields inside state; learn score from the broadcast.
+updates: [{ clientId, state: { position: [x, y], health, name, color } }]
+```
+
+### Failure modes
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Join `409` `character_schema_mismatch` | Another client already stored a different schema for this `game_id` | Rejoin with the `character_schema` from the `409` body (demos do this once) |
+| PATCH `422` `unknown character field: X` | `X` is not in the schema | Declare `X` in the schema (new `game_id`) or stop sending it |
+| PATCH `422` legacy shape | Top-level `position` / `health` / `metadata` / `velocity` / … outside `state` | Move everything inside `state` |
+| `dropped_server_fields: ["score"]` | Patch tried to set a server-owned field | Stop sending `score`; read it from the `source: "server"` broadcast |
+| `422` `missing required character fields` | Merged full state lacks a `required` field with no default | Send the field at least once, or give it a `default` |
+| Two players never match | Fingerprint mismatch — including different `character_schema` | Log `config.fingerprint()` on both clients, diff them |
+| Score never changes / double-counts | Client increments locally instead of reading the server broadcast | Remove the local increment; apply `applySelfCharacter()` on the broadcast |
 
 ---
 
 ## Client protocol — the 60-second version
 
-1. **Join** — `POST /join` with `GameSessionConfig`. Save `client_id` + `session_id`.
+1. **Join** — `POST /join` with `GameSessionConfig`, including `character_schema`. Save `client_id` + `session_id`. On `409`, rejoin once with the stored schema from the error body.
 2. **Stream** — `GET /stream?session_id=…`. Render the bootstrap, then apply patches.
-3. **Send input on your own cadence** — e.g. `requestAnimationFrame` for realtime, on-click for turn-based. No server tick to keep up with.
+3. **Send input on your own cadence** — e.g. `requestAnimationFrame` for realtime, on-click for turn-based. No server tick to keep up with. Send `{clientId, state: {...}}` with only client-owned, schema-declared fields.
 4. **Heartbeat** — if your game has long idle periods (lobby, thinking, paused), `POST /heartbeat` at least once per `disconnection_time_sec / 2`.
 5. **Leave** — `POST /leave` on unload / quit. If you don’t, the server evicts you on the next packet after your budget expires.
 
@@ -428,7 +631,18 @@ const joinRes = await fetch("/api/multiplayer/join", {
     environment_name: "my-game",
     character_name: "Ada",
     game_id: "my-game",
-    config: { game_id: "my-game", requires_matchmaking: false, requires_turn_based: false }
+    config: {
+      game_id: "my-game",
+      requires_matchmaking: false,
+      requires_turn_based: false,
+      character_schema: {
+        version: 1,
+        fields: {
+          position: { type: "vec2", required: true, authority: "client", semantic: "position" },
+          name: { type: "string", authority: "client", semantic: "name" }
+        }
+      }
+    }
   })
 });
 const { client_id, session_id } = await joinRes.json();
@@ -439,7 +653,7 @@ stream.addEventListener("datastar-patch-signals", (e) => applyPatch(JSON.parse(e
 await fetch("/api/multiplayer/character-state", {
   method: "PATCH",
   headers: { "Content-Type": "application/json", "X-Client-ID": client_id },
-  body: JSON.stringify({ updates: [{ clientId: client_id, pos: [10, 20] }], timestamp: Date.now() })
+  body: JSON.stringify({ updates: [{ clientId: client_id, state: { position: [10, 20], name: "Ada" } }], timestamp: Date.now() })
 });
 ```
 
@@ -459,7 +673,7 @@ MATCH supports two paths that share the same `join` shape. The choice is `requir
 | **Room creation** | First joiner creates a room for `environment_name` immediately. Later joiners append until `max_players_per_room`. | Joiner is queued. Rooms form only when enough queued players are mutually compatible. |
 | **Room id** | Deterministic from `environment_name` (`direct:<env>`) | New UUID per formed match |
 | **Latency to play** | Immediate | Waits for a match (see tolerance widening below) |
-| **Example** | `top-down-demo` (8 players, drop-in) | `tic-tac-toe` (2 players, 1v1) |
+| **Example** | `top-down-demo`, `babylon-demo` (drop-in) | `tic-tac-toe` (2 players, 1v1) |
 
 Both paths converge on the same `Room` object: `player_ids`, `status: waiting | in_progress | finished`, `custom`, `turn_manager` (if turn-based).
 
@@ -474,10 +688,11 @@ Both paths converge on the same `Room` object: `player_ids`, `status: waiting | 
 - `turn` rules (`max_turns`, `allow_pass`, `allow_resign`, `turn_order_strategy`)
 - `authority` scopes / resource types
 - `visibility`, `room_code`, `custom_rules`
+- `character_schema` (via its canonical hash — so different schemas never matchmake together; the registry’s one-schema-per-`game_id` `409` is the second enforcement)
 
 Deliberately **excluded**: `disconnection_time_sec` and `empty_game_ttl_sec`. Those are per-client / per-env hygiene budgets, not match compatibility. Two players with different disconnect budgets can still play together — each is evicted on their own budget.
 
-> If two players “should” match but don’t, check the fingerprint first. A single differing field (`turn_order_strategy`, `game_mode`, `room_code`) silently puts them in different queues.
+> If two players “should” match but don’t, check the fingerprint first. A single differing field (`turn_order_strategy`, `game_mode`, `room_code`, `character_schema`) silently puts them in different queues.
 
 ### Skill-aware matching — the algorithm
 
@@ -546,11 +761,12 @@ This is the classic fairness-vs-wait tradeoff: tight at first for fair games, lo
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Two players never match | Fingerprint mismatch (different `turn` / `game_mode` / `room_code` / `custom_rules`) | Log `config.fingerprint()` on both clients, diff them |
+| Two players never match | Fingerprint mismatch (different `turn` / `game_mode` / `room_code` / `custom_rules` / `character_schema`) | Log `config.fingerprint()` on both clients, diff them |
 | Long queue, no match | Tolerance cap too low, or `min_players_per_room` > queue size | Lower `max_skill_gap` cap is a *maximum*, not a target — raise it, or lower `min_players` |
 | Unfair match | `max_initial_skill_gap` too wide | Tighten to 50–100 for ranked, 200+ for casual |
 | Player stuck in queue after tab close | No packet arrived to sweep them | Queue is swept on the next packet from any client; heartbeat from other players unblocks it |
 | Same player matched twice | Double `join` (e.g. React StrictMode) | Dedupe by `player_id` on the client, or call `leave` before re-joining |
+| Join `409` `character_schema_mismatch` | Different schema for the same `game_id` | Rejoin with the stored schema from the `409` body |
 
 ### Tuning cheat-sheet
 
@@ -572,15 +788,15 @@ This is the classic fairness-vs-wait tradeoff: tight at first for fair games, lo
 
 |  | Realtime (`requires_turn_based: false`) | Turn-based (`requires_turn_based: true`) |
 |---|---|---|
-| **Examples** | Top-down collector, shooters, racing, sandbox, party games | Tic-tac-toe, chess, checkers, card games, word games |
+| **Examples** | Top-down collector, Babylon 3D collector, shooters, racing, sandbox, party games | Tic-tac-toe, chess, checkers, card games, word games |
 | **Who decides order?** | Nobody — everyone acts whenever they want | Server — `TurnManager` enforces `turn_order` |
 | **Client sends** | `character-state` every frame / tick, `item-state` collections | `turn/action` only on your turn, plus `turn/pass`, `turn/resign` |
-| **Server validates** | Authority for items, disconnect, env binding | + Is it your turn? Is the room `in_progress`? Is the action legal for your validator? |
+| **Server validates** | Authority for items, disconnect, env binding, character-schema shape + authority | + Is it your turn? Is the room `in_progress`? Is the action legal for your validator? |
 | **State broadcast** | Patches as they arrive | `turnState` patch + `game-over` when finished |
 | **Idle players** | Kicked by `disconnection_time_sec` if silent | Same — but see “thinking time” below |
 | **Best for** | Continuous movement, reflexes, simultaneous play | Discrete moves, strategy, async / slow play, anti-cheat |
 
-You can mix them: a turn-based game can still send `character-state` for cursors / hover / avatars, and a realtime game can use `custom-state` for scores. The flag only controls whether `TurnManager` gates actions.
+You can mix them: a turn-based game can still send `character-state` for cursors / hover / avatars (declared in its schema), and a realtime game can use `custom-state` for scores. The flag only controls whether `TurnManager` gates actions.
 
 ### Turn-based in detail
 
@@ -650,11 +866,11 @@ This is why turn-based games should still send `heartbeat` or `character-state` 
 
 No `TurnManager`. Clients send `character-state` at their own cadence (the demos use `requestAnimationFrame`, throttled to ~20–30 Hz). The server:
 
-- Relays updates to everyone in the env (dirty-filtered — unchanged positions are not rebroadcast).
+- Validates each patch against the game’s `character_schema`, merges it into the stored full state, drops server-owned fields from client patches, and relays the merged result to everyone in the env (dirty-filtered — unchanged positions are not rebroadcast).
 - Tracks `FreshnessMatrix` so a late joiner gets the latest state, not a replay of every frame.
 - Gates `item-state` updates by authority (see below).
 
-Realtime games still need `custom-state` for scores, timers, and win conditions — e.g. top-down stores `score` in `character-state.metadata` and `custom` for room-level flags.
+Realtime games still need `custom-state` for room-level scores, timers, and win conditions — per-player `score` in the gem games is *not* custom state: it is a server-authoritative `character_schema` field, incremented by the server on collection and broadcast with `source: "server"`.
 
 ### Which mode should you pick?
 
@@ -674,30 +890,56 @@ Realtime games still need `custom-state` for scores, timers, and win conditions 
 
 **Pick both / hybrid if:**
 
-- Turn-based core + realtime avatars (e.g. chess with live cursors).
+- Turn-based core + realtime avatars (e.g. chess with live cursors — declare the cursor in the schema).
 - Realtime movement + turn-based combat (e.g. top-down with turn-based duels).
 - Lobby is realtime, match is turn-based — switch `requires_turn_based` per `game_id`, not per room.
 
 ### Config examples
 
 ```jsonc
-// Turn-based: tic-tac-toe, 1v1, ranked
+// Turn-based: tic-tac-toe, 1v1, ranked — empty character schema
 {
   "game_id": "tic-tac-toe",
   "requires_matchmaking": true,
   "requires_turn_based": true,
   "max_players_per_room": 2,
   "min_players_per_room": 2,
-  "turn": { "max_turns": 9, "allow_pass": false, "allow_resign": true, "turn_order_strategy": "join_order" }
+  "turn": { "max_turns": 9, "allow_pass": false, "allow_resign": true, "turn_order_strategy": "join_order" },
+  "character_schema": { "version": 1, "fields": {} }
 }
 
-// Realtime: top-down, drop-in, 8 players
+// Realtime: top-down, drop-in, 8 players — schema with server score
 {
   "game_id": "top-down-demo",
   "requires_matchmaking": false,
   "requires_turn_based": false,
   "max_players_per_room": 8,
-  "min_players_per_room": 1
+  "min_players_per_room": 1,
+  "character_schema": { "version": 1, "fields": {
+    "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+    "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+    "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+    "name": {"type": "string", "authority": "client", "semantic": "name"},
+    "color": {"type": "string", "authority": "client"}
+  } }
+}
+
+// Realtime: Babylon, 3D third-person, drop-in — same gem protocol + yaw / anim
+{
+  "game_id": "babylon-demo",
+  "requires_matchmaking": false,
+  "requires_turn_based": false,
+  "max_players_per_room": 8,
+  "min_players_per_room": 1,
+  "character_schema": { "version": 1, "fields": {
+    "position": {"type": "vec2", "required": true, "authority": "client", "semantic": "position"},
+    "health": {"type": "int", "required": true, "min": 0, "max": 100, "authority": "client", "semantic": "health"},
+    "score": {"type": "int", "authority": "server", "default": 0, "min": 0, "semantic": "score"},
+    "name": {"type": "string", "authority": "client", "semantic": "name"},
+    "color": {"type": "string", "authority": "client"},
+    "yaw": {"type": "number", "authority": "client"},
+    "anim": {"type": "string", "authority": "client"}
+  } }
 }
 
 // Realtime + matchmaking: 4-player FFA, skill-balanced
@@ -823,7 +1065,7 @@ setInterval(() => { if (clientId) sendHeartbeat(); }, 20000); // for 60s budget
 
 | Game | Recommended `disconnection_time_sec` | Why |
 |---|---|---|
-| Fast realtime (shooter, racer, top-down) | `15–30` | A frozen player should not block the field. Others should see them vanish quickly. |
+| Fast realtime (shooter, racer, top-down, Babylon) | `15–30` | A frozen player should not block the field. Others should see them vanish quickly. |
 | Casual realtime (party, sandbox) | `60` (default) | Forgiving for tab switches, phone calls, slow networks. |
 | Turn-based, live (blitz chess, tic-tac-toe) | `60–120` | Enough to think + reconnect, short enough that the opponent isn’t stuck. |
 | Turn-based, slow / correspondence | `0` (never) or `3600+` | Players may take hours. Eviction would end games unfairly. Use `0` + explicit `leave` / `resign`. |
@@ -836,7 +1078,7 @@ setInterval(() => { if (clientId) sendHeartbeat(); }, 20000); // for 60s budget
 | Option | What it deletes | When |
 |---|---|---|
 | `disconnection_time_sec` (default 60) | A *client* (one player) | After that client is silent that long |
-| `empty_game_ttl_sec` (default 300) | A *game’s data* (items, rooms, authority) | After the *game* is empty that long |
+| `empty_game_ttl_sec` (default 300) | A *game’s data* (items, rooms, authority, character schema) | After the *game* is empty that long |
 
 A game can be empty for 5 minutes even though every client was evicted after 60s of silence. The first clock removes players; the second clock removes the game they left behind.
 
@@ -861,20 +1103,23 @@ Because `disconnection_time_sec` is excluded from the matchmaking fingerprint, a
 | Data | Owner | Client can… |
 |---|---|---|
 | Room, turn order, winner | Server | Request actions, never set |
-| Items (e.g. gems) | Server (top-down) | Collect only; never spawn / move |
-| Character position | Client (its own) | Send its own `character-state`; server relays |
+| Items (e.g. gems) | Server (gem games) | Collect only; never spawn / move |
+| Character position | Client (its own) | Send its own `character-state` for a declared client-owned field; server relays |
+| Character score (gem games) | Server | Never send it — read it from the `source: "server"` broadcast |
 | Custom rules / scores | Server (via `custom-state`) | Send `custom-state` if authority allows |
 | Authority | Server (`AuthorityManager`) | Claim / release if `allow_client_claims` |
 
-**Top-down example, end to end:**
+**Gem games, end to end** (top-down + Babylon — same mechanic, separate fields):
 
-1. Billy joins first → server spawns 24 gems (`server_spawned: True`, `instanceId: top-down-demo:gem-N`).
+1. Billy joins `top-down-demo` first → server spawns 24 gems (`server_spawned: True`, `instanceId: top-down-demo:gem-N`).
 2. Jill joins → bootstrap contains the *same* 24 gems. No client spawn, no duplication.
-3. Billy collects `gem-1` → server marks collected, spawns `gem-25`, broadcasts `collections: [gem-1]` + `updates: [gem-25]` in one packet. Both clients see `-1 +1`.
+3. Billy collects `gem-1` → server marks collected, spawns a replacement, increments Billy’s server-authoritative `score`, and broadcasts `collections: [gem-1]` + `updates: [replacement]` + the updated character state (`source: "server"`) in one packet. Both clients see `-1 +1`, Billy sees `score +1`.
 4. Billy leaves → gems stay. Jill keeps playing. If Jill is now synchronizer, she is a label — the server still owns gems.
 5. Both leave → env empty → 5-minute grace clock starts.
-6. Someone rejoins within 5 min → same gems (minus collected, plus respawns) resume.
-7. No one rejoins for 5 min → next packet from *any* game deletes the game’s data. Next join gets a fresh 24.
+6. Someone rejoins within 5 min → same gems (minus collected, plus respawns) and the same character schema resume.
+7. No one rejoins for 5 min → next packet from *any* game deletes the game’s data, including the stored character schema. Next join gets a fresh 24 and may declare a fresh schema.
+
+Babylon works exactly the same way in its own env (`babylon-demo:gem-N`). The two games never share gems: `_is_gem_game()` — not `_is_top_down_game()` — gates the gem logic, so Babylon gets gems without being mislabelled a top-down game.
 
 ### Authority — why it matters
 
@@ -885,7 +1130,7 @@ Because `disconnection_time_sec` is excluded from the matchmaking fingerprint, a
 
 `handle_item_state` drops any `update` where `resolved_owner != sender`. This is silent by design — a stale client sending old positions should not error the whole room, it should just be ignored.
 
-For server-spawned games (`top-down-demo`), the server bypasses this check entirely — it writes `item_cache` directly. Client updates for server gems are always dropped.
+For server-spawned games (`top-down-demo`, `babylon-demo`), the server bypasses this check entirely — it writes `item_cache` directly. Client updates for server gems are always dropped.
 
 Failover: when the authority holder leaves / times out, `client_leaves()` promotes the next client and broadcasts `env-item-authority-changed`. The new authority does *not* need to re-spawn anything — the server already holds the game.
 
@@ -896,7 +1141,7 @@ Failover: when the authority holder leaves / times out, `client_leaves()` promot
 ```
 
 - Set on `join` → `config`. Captured from the last client in the env when it becomes empty.
-- Deletion is **lazy, event-driven**: `_sweep_empty_games_locked(now)` runs on every packet (inside `_sweep_expired_locked`). If `now - empty_since > ttl`, `_delete_game_data_locked(env)` removes items, `item_environments`, dirty cache, empty rooms, env authority, gem counter.
+- Deletion is **lazy, event-driven**: `_sweep_empty_games_locked(now)` runs on every packet (inside `_sweep_expired_locked`). If `now - empty_since > ttl`, `_delete_game_data_locked(env)` removes items, `item_environments`, dirty cache, empty rooms, env authority, gem counter, and the stored character schema for that game.
 - If *no* packet arrives, deletion waits — same tradeoff as disconnect. A single heartbeat from any game is enough to trigger cleanup for all expired empty games.
 
 To test quickly, set `empty_game_ttl_sec: 10` in the demo, leave all players, wait 11s, send any packet (join another game, heartbeat), then rejoin — you should get a fresh field.
@@ -917,12 +1162,33 @@ To test quickly, set `empty_game_ttl_sec: 10` in the demo, leave all players, wa
 | `matchmaking` | `MatchmakingConfig` | — | See below |
 | `turn` | `TurnConfig` | — | See below |
 | `authority` | `AuthorityConfig` | — | See below |
+| `character_schema` | `CharacterSchema` | empty (`fields: {}`) | Declared per-player state for this `game_id`. First join stores it; later joins must match it exactly (`409` otherwise). See [Character state](#character-state--schema-declared). |
 | `visibility` | `"public" \| "private"` | `"public"` | Private needs `room_code` |
 | `room_code` | `str \| null` | `null` | Private room join key, fingerprinted |
 | `custom_rules` | `dict` | `{}` | Game-specific, fingerprinted |
 | `metadata` | `dict` | `{}` | Opaque, not fingerprinted |
 | `disconnection_time_sec` | `float` | `60.0` | `[0, 86400]`, `0` = never expire. Aliases: `disconnectionTime`, `disconnection_time`, `disconnect_timeout_sec`, `disconnectTimeout` |
 | `empty_game_ttl_sec` | `float` | `300.0` | `[0, 86400]`, `0` = keep forever. Aliases: `emptyGameTtlSec`, `emptyGameTtl` |
+
+### `CharacterSchema`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `version` | `int` | `1` | Part of schema identity. Must be `>= 1`. |
+| `fields` | `dict[str, CharacterField]` | `{}` | Alias: `properties`. At most 64 fields. Empty = no character state (tic-tac-toe). |
+| `allow_unknown` | `bool` | `false` | Alias: `allowUnknown`. `true` = relay undeclared fields unvalidated (prototyping only). |
+
+### `CharacterField`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `type` | `str` | — (required) | `string` \| `int` \| `number` \| `bool` \| `enum` \| `vec2` \| `vec3` |
+| `required` | `bool` | `false` | Enforced on merged full state, not on a patch |
+| `default` | `any` | `null` = no default | Filled in when missing from merged state. `null` is never a valid value. |
+| `min` / `max` | `number` | `null` | Bounds (numeric / per-component / string length). Aliases: `min_value` / `minimum`, `max_value` / `maximum`. |
+| `values` | `list` | `null` | `enum` only, non-empty. Alias: `enum_values`. |
+| `authority` | `"client" \| "server"` | `"client"` | Alias: `server_only: true` = `"server"`. |
+| `semantic` | `str` | `null` | Hint for generic tools: `position`, `health`, `score`, `name`, … |
 
 ### `MatchmakingConfig`
 
@@ -963,21 +1229,32 @@ To test quickly, set `empty_game_ttl_sec: 10` in the demo, leave all players, wa
 `GET /tic-tac-toe`
 
 - `requires_matchmaking: true`, `requires_turn_based: true`, `2 / 2` players.
+- Empty character schema (`fields: {}`) — it sends no character state.
 - Click a cell → `POST /turn/action`. Server validates turn + cell empty, advances turn, broadcasts `turnState`.
 - `Pass` disabled (`allow_pass: false`), `Resign` enabled.
 - Opponent leaves → `game-over`, `endReason: opponent_left`.
 
-### Top-down — realtime, direct room
+### Top-down — realtime, direct room, 2D
 
 `GET /top-down`
 
 - `requires_matchmaking: false`, `requires_turn_based: false`, `8 / 1` players.
 - WASD / arrows to move, walk over gems to collect.
-- Gems are server-spawned: 24 live, respawn 1 per collection.
+- Gems are server-spawned: 24 live, respawn 1 per collection. `score` is a server-authoritative schema field — the demo never sends it and never increments it locally.
+- Character schema: `position`, `health`, `score` (server), `name`, `color`.
 - HUD: `Gems`, `Players`, `Gems on map`, `Synchronizer`, `Drop if silent: 60s`, `Game data deleted if empty 5 min`.
 - `Heartbeat` button sends an explicit keep-alive. `Leave` removes you; if you just close the tab, you’re evicted on the next packet after 60s of silence.
 
-Both demos are single HTML files in `server/app/demo/` — read them as the canonical client implementation.
+### Babylon — realtime, direct room, 3D third-person
+
+`GET /babylon` (also `/demo/babylon`, `/babylon.html`, `/demo/babylon.html`)
+
+- Same protocol as top-down, same gem mechanic, its own `game_id` / env (`babylon-demo`, `babylon-demo:gem-N`).
+- 3D third-person — **not** a top-down game. It shares the gem mechanic, not the camera.
+- Character schema: top-down’s fields plus `yaw` (`number`) and `anim` (`string`) for orientation / animation, plus server `score`.
+- Loads `hulk.glb` relatively (`/hulk.glb` / `/demo/hulk.glb`).
+
+All demos are single HTML files in `server/app/demo/` — read them as the canonical client implementation. Top-down and Babylon are the canonical schema clients: schema on join, `409` retry, `{clientId, state}` patches, partial-safe inbound handling, server score via broadcast only.
 
 ---
 
@@ -996,7 +1273,7 @@ python -m server.app.main
 - **Build:** `pip install -r requirements.txt`
 - **Start:** `uvicorn server.app.main:app --host 0.0.0.0 --port $PORT`
 - **Health:** `GET /` should return JSON with endpoints.
-- **Check demos:** `GET /top-down` and `GET /demo/top-down` return the same HTML. If `/top-down` 404s, you deployed an old `main.py` without the `def top_down_demo_page` route — redeploy.
+- **Check demos:** `GET /top-down` and `GET /demo/top-down` return the same HTML; `GET /babylon` and `GET /demo/babylon` return the same HTML, and `GET /demo/hulk.glb` returns the model. If `/top-down` 404s, you deployed an old `main.py` without the demo routes — redeploy.
 - **No background workers needed.** There is no timer loop to keep alive. A free Render instance that sleeps is fine — the next packet after wake-up sweeps expired clients + empty games.
 
 ### Environment
@@ -1008,7 +1285,7 @@ python -m server.app.main
 
 ### Scaling notes
 
-- This is an **in-memory** registry (`MultiplayerRegistry`). It is correct for one process. For multi-process / multi-instance deployments, you need a shared store (Redis) for `clients`, `rooms`, `item_cache`, and a shared `now` — or sticky sessions per `environment_name`.
+- This is an **in-memory** registry (`MultiplayerRegistry`). It is correct for one process. For multi-process / multi-instance deployments, you need a shared store (Redis) for `clients`, `rooms`, `item_cache`, `game_character_schemas`, and a shared `now` — or sticky sessions per `environment_name`.
 - SSE connections are long-lived. Put a proxy timeout > your longest expected game, or reconnect on `stream.onerror` (demos do this via `EventSource` retry).
 
 ---
@@ -1018,7 +1295,8 @@ python -m server.app.main
 - **No auth in the demo protocol.** `player_id` is client-supplied. For production, put MATCH behind your own auth (e.g. verify a JWT in a middleware and set `player_id` from the token, not from the body).
 - **Rate-limit `join` / `character-state`.** A client sending 1000 Hz `character-state` will spam every other client. Throttle on the client (20–30 Hz) *and* on the server (per-client rate limit).
 - **Validate `custom_rules` / `custom` size.** They are opaque dicts — cap keys / bytes to avoid memory bloat.
-- **Don’t trust `skill.rating`.** It is client-reported by default. For ranked play, resolve skill server-side in `SkillProvider`.
+- **Character-state limits are enforced:** at most 64 schema fields, at most 64 keys / 8192 bytes per patch. A closed schema (`allow_unknown: false`) rejects undeclared fields; `allow_unknown: true` relays them unvalidated — prototyping only, not for production.
+- **Don’t trust `skill.rating` or client-set `score`.** Skill is client-reported by default; for ranked play, resolve skill server-side in `SkillProvider`. Score is server-owned in the gem games — a client patch containing it is dropped, never trusted.
 - **CORS.** If your game is on another origin, add `CORSMiddleware` with your game’s origin only.
 - **InstanceIds.** Namespaced ids (`<env>:<id>`) prevent cross-game collisions. Bare ids are bound to the sender’s env on first sight — don’t reuse a bare id across games.
 
@@ -1032,10 +1310,13 @@ cd match
 git checkout -b feat/my-game-adapter
 # Add a validator in MultiplayerRegistry.VALIDATORS, or a demo in server/app/demo/
 # Keep the event-driven rule: no timers, no sleeps, no background loops.
+# If your game needs character state, declare it in character_schema —
+# do not invent a new top-level shape.
 # Add a test for your path if you add server logic.
 git commit -m "feat: add <game> validator"
 git push origin feat/my-game-adapter
-# Open a PR — please include: what game, what config, how you tested (2 tabs? 2 players?)
+# Open a PR — please include: what game, what config, what character_schema,
+# how you tested (2 tabs? 2 players?)
 ```
 
 Good PRs: a new game validator, a new demo, a `SkillProvider` implementation, docs fixes. Please don’t add a timer loop — if you think you need one, open an issue and describe the packet that should trigger the work instead.
@@ -1045,8 +1326,3 @@ Good PRs: a new game validator, a new demo, a `SkillProvider` implementation, do
 ## License
 
 MIT — see `LICENSE`. Use it in your game, your jam, your class, your startup. If you ship something with MATCH, a link back is appreciated but not required.
-
----
-
-
-

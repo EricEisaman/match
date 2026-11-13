@@ -25,6 +25,9 @@
   4-way scroller. Move with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys.
   Walk over a <code>gem</code> to collect it. Gems are <code>item-state</code> —
   <code>updates</code> spawn them, <code>collections</code> collect them.
+  Character state is schema-declared: <code>state: {position, health, name, color}</code>,
+  and <code>score</code> is server-authoritative — the server increments it on collection,
+  this client never sends it.
   No timers anywhere: movement is
   <code>keydown</code>/<code>keyup</code> + <code>requestAnimationFrame</code>,
   disconnect is enforced by the server on the next packet (see below).
@@ -66,11 +69,60 @@
 // Server-authoritative: the server spawns gems on first join, keeps 24
 // live, respawns 1 per collection, and deletes game data if empty 5 min
 // (lazily, on the next packet). Clients send character-state + collections only.
+//
+// CHARACTER STATE — SCHEMA-DECLARED (protocol v1)
+// - There are NO top-level position / health / score / metadata fields
+//   anymore. The ONLY universal top-level character field is `clientId`.
+//   Everything else lives inside `state` and must be declared in
+//   `config.character_schema` on join (see CHARACTER_SCHEMA below).
+// - This demo declares:
+//       position: vec2, required, client   (server 2000-space [x, y])
+//       health:   int 0..100, required, client
+//       score:    int >= 0, SERVER authority, default 0
+//       name:     string, client
+//       color:    string, client
+//   Dropped from the old shape on purpose: velocity, animationState,
+//   animationFrame, isJumping, facing, onGround, characterModelId —
+//   this demo sends them but never renders inbound ones (it just draws
+//   a square + health bar + name), so they are not declared.
+// - The FIRST client to join `top-down-demo` stores that schema for the
+//   whole game_id. A later join declaring a different schema gets
+//   409 + the stored schema; this demo retries once with the stored
+//   schema. To change the schema, use a new game_id or wait for the
+//   empty-game TTL to clear the old game data.
+// - `score` is SERVER-authoritative: this client NEVER sends it.
+//   A patch containing `score` would have it dropped (see
+//   `dropped_server_fields` in the PATCH response). The server
+//   increments `score` on gem collection and broadcasts the updated
+//   full state with `source: "server"` — that broadcast is the ONLY
+//   way this client learns its new score. Do NOT increment locally
+//   on collection (the old demo did; that double-counted).
+// - PATCHes are partial: a patch may send one field at a time.
+//   The server merges it into the stored full state, fills defaults,
+//   then enforces `required` on the merged result.
 // ---------------------------------------------------------------------------
 const WORLD_W = 2000, WORLD_H = 2000;
 const SPEED = 220; // px/sec
 const PLAYER_SIZE = 32;
 const GEM_RADIUS = 14;
+
+// Character schema declared on join. First join for game_id "top-down-demo"
+// stores it server-side; later joins must match it exactly (409 otherwise).
+// score is server-authoritative: NEVER send it in a character-state PATCH.
+const CHARACTER_SCHEMA = {
+  version: 1,
+  fields: {
+    position: { type: "vec2", required: true, authority: "client", semantic: "position" },
+    health: { type: "int", required: true, min: 0, max: 100, authority: "client", semantic: "health" },
+    score: { type: "int", authority: "server", default: 0, min: 0, semantic: "score" },
+    name: { type: "string", authority: "client", semantic: "name" },
+    color: { type: "string", authority: "client" },
+  },
+};
+// Effective schema: ours, unless the server answers 409 with the stored
+// schema for this game_id — then we retry once with that stored schema.
+let effectiveSchema = CHARACTER_SCHEMA;
+
 let clientId = null, sessionId = null, roomId = null;
 let isSynchronizer = false;
 let stream = null;
@@ -102,7 +154,7 @@ async function join() {
   me.x = WORLD_W / 2 + (Math.random() * 120 - 60);
   me.y = WORLD_H / 2 + (Math.random() * 120 - 60);
   me.score = 0; me.health = 100;
-  const res = await api("/api/multiplayer/join", { method: "POST", body: JSON.stringify({
+  const postJoin = (schema) => api("/api/multiplayer/join", { method: "POST", body: JSON.stringify({
     environment_name: "top-down-demo",
     character_name: name,
     game_id: "top-down-demo",
@@ -120,10 +172,21 @@ async function join() {
       disconnection_time_sec: disconnectSec,
       empty_game_ttl_sec: 300, // delete game data if empty 5 min (lazy, on next packet)
       authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
+      character_schema: schema,
     },
   })});
-  const data = await res.json();
+  let res = await postJoin(CHARACTER_SCHEMA);
+  let data = await res.json().catch(() => ({}));
+  if (res.status === 409 && data.character_schema) {
+    // Another client already stored a different schema for this
+    // game_id. Rejoin once with the stored schema (protocol fail-fast).
+    log("join: schema mismatch, retrying with server-stored schema");
+    effectiveSchema = data.character_schema;
+    res = await postJoin(effectiveSchema);
+    data = await res.json().catch(() => ({}));
+  }
   if (!res.ok) { log("join failed: " + JSON.stringify(data)); return; }
+  if (data.character_schema) effectiveSchema = data.character_schema;
   clientId = data.client_id; sessionId = data.session_id; roomId = data.room_id || null;
   isSynchronizer = !!data.is_synchronizer;
   $("status").textContent = `Joined as ${name} · Room ${roomId || ""} · ${isSynchronizer ? "synchronizer" : "client"}`;
@@ -176,6 +239,9 @@ async function collectGem(instanceId) {
   })});
   lastPacketMs = performance.now();
   if (!res.ok) { pendingCollections.delete(instanceId); log("collect failed: " + res.status); }
+  // No local score change here: the server increments the
+  // server-authoritative score and broadcasts the updated character
+  // state (source "server"). applyMp() applies that broadcast.
 }
 async function sendHeartbeat() {
   if (!clientId) return;
@@ -191,14 +257,25 @@ async function sendCharacterState(force) {
   const now = performance.now();
   if (!force && now - lastSentMs < 50) return; // rAF timestamp throttle, not a timer
   lastSentMs = now; lastPacketMs = now;
+  // Schema shape: {clientId, state: {...}}. Only client-owned fields.
+  // NEVER send score — it is server-authoritative and would be dropped.
+  // NEVER send top-level position / health / metadata / velocity /
+  // animationState / facing — the server rejects legacy shapes with 422.
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, characterModelId: "square", position: [me.x, me.y], velocity: [me.vx, me.vy],
-      animationState: (me.vx || me.vy) ? "run" : "stand", animationFrame: 0, isJumping: false,
-      facing: me.vx < 0 ? -1 : 1, score: me.score, health: me.health, onGround: true, timestamp: Date.now(),
-      metadata: { health: me.health, name: me.name, color: me.color } }],
+    updates: [{ clientId, state: {
+      position: [me.x, me.y],
+      health: me.health,
+      name: me.name,
+      color: me.color,
+    } }],
     timestamp: Date.now(),
   })});
   if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
+  else if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    log("character-state rejected (" + res.status + "): " + JSON.stringify(d));
+    if (d.dropped_server_fields) log("dropped_server_fields: " + JSON.stringify(d.dropped_server_fields));
+  }
 }
 // --- SSE / mp signal --------------------------------------------------------
 function handleStreamData(raw) {
@@ -219,6 +296,39 @@ function connectStream() {
   stream.onmessage = (ev) => handleStreamData(ev.data);
   stream.onerror = () => { log("stream error — EventSource will retry"); };
 }
+// Apply one broadcast character entry {clientId, state, source}.
+// Own entries are the score channel: the server's score broadcast
+// (source "server") is the only place our score changes. Never
+// overwrite our own position from our own echo — we already have it.
+function applySelfCharacter(st) {
+  if (typeof st.score === "number" && st.score !== me.score) {
+    me.score = st.score;
+    $("hudScore").textContent = `Gems: ${me.score}`;
+  }
+  if (typeof st.health === "number" && st.health !== me.health) {
+    me.health = st.health;
+  }
+  const self = players.get(clientId);
+  if (self) { self.score = me.score; self.health = me.health; }
+}
+// Partial-safe: server broadcasts may be partial (e.g. a server-only
+// score update has state {score} and no position). Only fields present
+// in `data` overwrite the stored value; missing fields keep their
+// previous value. A brand-new remote starts from defaults.
+function upsertRemote(id, data) {
+  let p = players.get(id);
+  if (!p) {
+    p = { x: WORLD_W / 2, y: WORLD_H / 2, health: 100, score: 0, name: data.name || "player", color: data.color || colorFor(id) };
+    players.set(id, p);
+  }
+  if (typeof data.x === "number") p.x = data.x;
+  if (typeof data.y === "number") p.y = data.y;
+  if (typeof data.health === "number") p.health = data.health;
+  if (typeof data.score === "number") p.score = data.score;
+  if (data.name !== undefined) p.name = data.name;
+  if (data.color) p.color = data.color;
+  return p;
+}
 function applyMp(mp) {
   if (!mp) return;
   if (mp.connection) {
@@ -230,15 +340,22 @@ function applyMp(mp) {
     }
     if (mp.connection.roomId) roomId = mp.connection.roomId;
   }
-  // Characters: full snapshot in bootstrap, patches after. Never trust a
-  // character update for yourself — your local pos is authoritative for you.
+  if (mp.characterSchema) effectiveSchema = mp.characterSchema;
+  // Characters: full snapshot in bootstrap, patches after.
   if (Array.isArray(mp.characters)) {
     for (const c of mp.characters) {
-      if (!c || !c.clientId || c.clientId === clientId) continue;
-      const meta = c.metadata || {};
-      players.set(c.clientId, { x: (c.position || [0, 0])[0], y: (c.position || [0, 0])[1],
-        health: c.health ?? meta.health ?? 100, score: c.score ?? 0,
-        name: meta.name || c.characterModelId || "player", color: meta.color || colorFor(c.clientId) });
+      if (!c || !c.clientId) continue;
+      const st = c.state || {};
+      if (c.clientId === clientId) { applySelfCharacter(st); continue; }
+      const pos = Array.isArray(st.position) ? st.position : null;
+      upsertRemote(c.clientId, {
+        x: pos ? pos[0] : undefined,
+        y: pos ? pos[1] : undefined,
+        health: st.health,
+        score: st.score,
+        name: st.name,
+        color: st.color,
+      });
     }
   }
   // Items: updates = spawn / move, collections = collected exactly once.
@@ -253,9 +370,11 @@ function applyMp(mp) {
     if (Array.isArray(mp.items.collections)) {
       for (const coll of mp.items.collections) {
         if (!coll || !coll.instanceId) continue;
-        const wasMine = coll.collectedByClientId === clientId;
+        // Score is NOT updated here. The server already broadcast (or
+        // is about to broadcast) the character-state-update with the
+        // incremented server-authoritative score; applySelfCharacter
+        // applies it. Incrementing here would double-count.
         gems.delete(coll.instanceId); pendingCollections.delete(coll.instanceId);
-        if (wasMine) { me.score += 1; $("hudScore").textContent = `Gems: ${me.score}`; sendCharacterState(true); }
         // Server respawns 1 gem per collection in the same packet.
         // No client top-up — server keeps the field at 24.
       }
