@@ -34,6 +34,8 @@ from .multiplayer.dirty import DirtyFilter, FreshnessMatrix
 from datastar_py.fastapi import DatastarResponse
 from datastar_py import ServerSentEventGenerator as SSE
 
+from demos import needs_server_gems, gem_target, is_turn_based
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -312,8 +314,6 @@ class MultiplayerRegistry:
         # Gem games: server spawns gems, not the synchronizer client.
         # Per-env gem counter so instanceIds never collide / get reused.
         self._top_down_gem_counter: Dict[str, int] = {}
-        # How many live gems the server keeps on the field.
-        self.TOP_DOWN_GEM_TARGET = 24
         # How long an empty game keeps its data before lazy deletion.
         self.EMPTY_GAME_TTL_SEC = 300.0
 
@@ -352,12 +352,8 @@ class MultiplayerRegistry:
         return game_id == "top-down-demo" or env_name == "top-down-demo"
 
     def _is_gem_game(self, game_id: str = "", env_name: str = "") -> bool:
-        # Games whose field is server-spawned gems (24 live, respawn
-        # on collect, server-authoritative score). top-down-demo is
-        # the 2D top-down one; babylon-demo is the 3D third-person
-        # one. Each gets its OWN env (top-down-demo:gem-N vs
-        # babylon-demo:gem-N) — they never share gems.
-        return game_id in ("top-down-demo", "babylon-demo") or env_name in ("top-down-demo", "babylon-demo")
+        # Delegates to demos.py — no per-game list here anymore.
+        return needs_server_gems(game_id, env_name)
 
     def _delete_game_data_locked(self, env_name: str, now_ms: int) -> List[str]:
         """Delete ALL stored data for one empty game (env). Caller holds lock."""
@@ -482,14 +478,15 @@ class MultiplayerRegistry:
         Called on first join, on env switch, and after every collection
         (to top up).
         """
+        target = gem_target(game_id, env_name)
         if not self._is_gem_game(game_id, env_name):
             return []
         live = sum(1 for v in self.item_cache.values()
-                   if isinstance(v, dict) and v.get("environment") == env_name
-                   and not v.get("isCollected"))
-        if live >= self.TOP_DOWN_GEM_TARGET:
+                if isinstance(v, dict) and v.get("environment") == env_name
+                and not v.get("isCollected"))
+        if live >= target:
             return []
-        return self._spawn_top_down_gems_locked(env_name, self.TOP_DOWN_GEM_TARGET - live, now_ms)
+        return self._spawn_top_down_gems_locked(env_name, target - live, now_ms)
 
     # -- disconnection: event-driven, no timers -------------------------
     def _is_expired(self, session: ClientSession, now_ms: int) -> bool:
