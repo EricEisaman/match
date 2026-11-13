@@ -2,10 +2,26 @@
 
 Transport: HTTPS + SSE (Datastar)
 Encoding: JSON UTF-8
+
+Protocol version: 1 (alpha). The version stays at 1 until the project
+leaves alpha. Breaking changes during alpha are noted in the changelog,
+not signalled by a version bump. Clients must check
+``Capabilities.features["characterSchema"]``, not the version number.
+
+Character state is schema-declared. The only universal top-level
+character field is ``clientId``. Every other field is declared in
+``GameSessionConfig.character_schema`` by the first connecting client
+for a given ``game_id``, stored once per ``game_id`` (same schema for
+all rooms of that game), kept with the game data through
+``empty_game_ttl_sec``, and enforced for every later join. A field may
+be declared ``authority: "server"``; clients cannot set it, only
+server code can.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass, field, asdict
@@ -204,6 +220,390 @@ class AuthorityConfig:
         return "*" in self.resource_types or resource_type in self.resource_types
 
 
+# ---------------------------------------------------------------------------
+# Character schema — what a game's per-player state looks like
+# ---------------------------------------------------------------------------
+#
+# There are no built-in character fields. The only universal top-level
+# character field is ``clientId``. Everything else is declared here, by
+# the first connecting client for a given ``game_id``, and stored once
+# per ``game_id`` in the registry (same schema for every room of that
+# game, including private rooms). A later join that declares a different
+# schema for the same ``game_id`` is rejected with 409 plus the stored
+# schema; it does not create a second bucket.
+#
+# The schema is kept with the game data: it survives the last client
+# leaving, and it is deleted when game data is deleted after
+# ``empty_game_ttl_sec``. To change a schema, use a new ``game_id`` or
+# wait for the TTL to clear the old game data.
+#
+# Example — top-down demo:
+#   {"version": 1, "fields": {
+#     "position": {"type": "vec2", "required": True, "authority": "client",
+#                  "semantic": "position"},
+#     "health": {"type": "int", "min": 0, "max": 100, "authority": "client",
+#                "semantic": "health"},
+#     "score": {"type": "int", "min": 0, "authority": "server",
+#               "semantic": "score"}}}
+# Example — tic-tac-toe: {"version": 1, "fields": {}} (no character state).
+#
+# ``semantic`` is a hint for generic tools (lobby, spectator, debug
+# view). It is never required. A generic tool looks for
+# ``semantic: "position"`` or ``semantic: "health"`` when present and
+# renders nothing when absent. It must not be confused with a required
+# top-level field.
+
+MAX_CHARACTER_SCHEMA_FIELDS = 64
+MAX_CHARACTER_STATE_KEYS = 64
+MAX_CHARACTER_STATE_BYTES = 8192
+
+CharacterFieldType = Literal["string", "int", "number", "bool", "enum", "vec2", "vec3"]
+CharacterFieldAuthority = Literal["client", "server"]
+_CHARACTER_FIELD_TYPES = ("string", "int", "number", "bool", "enum", "vec2", "vec3")
+_RESERVED_CHARACTER_FIELDS = ("clientId", "state", "timestamp", "source")
+
+
+@dataclass
+class CharacterField:
+    """One declared character field.
+
+    ``default`` is None when the field has no default. None is never a
+    valid value for any field type, so None unambiguously means
+    "no default". ``min`` / ``max`` are numeric bounds for ``int`` /
+    ``number``, per-component bounds for ``vec2`` / ``vec3``, and
+    length bounds for ``string``. They are not meaningful for ``bool``
+    or ``enum``. ``values`` is only allowed for ``enum``.
+    """
+
+    type: str = "number"
+    required: bool = False
+    default: Any = None
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    values: Optional[List[Any]] = None
+    authority: CharacterFieldAuthority = "client"
+    semantic: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.type not in _CHARACTER_FIELD_TYPES:
+            raise ValueError(f"character field type must be one of {list(_CHARACTER_FIELD_TYPES)}")
+        if not isinstance(self.required, bool):
+            raise ValueError("character field required must be a boolean")
+        if self.authority not in ("client", "server"):
+            raise ValueError('character field authority must be "client" or "server"')
+        if self.semantic is not None and (not isinstance(self.semantic, str) or not self.semantic):
+            raise ValueError("character field semantic must be a non-empty string")
+        if self.min_value is not None and self.max_value is not None and self.min_value > self.max_value:
+            raise ValueError("character field min must be <= max")
+        if self.type == "enum":
+            if not isinstance(self.values, list) or not self.values:
+                raise ValueError("character field of type enum must declare non-empty values")
+            for v in self.values:
+                if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+                    raise ValueError("character field enum values must be strings or numbers")
+                if isinstance(v, float) and not math.isfinite(v):
+                    raise ValueError("character field enum values must be finite")
+        else:
+            if self.values is not None:
+                raise ValueError("character field values is only allowed for type enum")
+            if self.type in ("bool", "enum") and (self.min_value is not None or self.max_value is not None):
+                raise ValueError("character field min/max are not meaningful for bool or enum")
+        if self.default is not None:
+            self.validate_value(self.default, field_name="<default>")
+
+    def validate_value(self, value: Any, *, field_name: str = "") -> Any:
+        """Validate one value, returning the normalized form.
+
+        Raises ValueError on any mismatch. Normalization: ``number``
+        becomes float, ``vec2`` / ``vec3`` become lists of floats.
+        Everything else is returned as given (enum values are not
+        coerced, so 1 and 1.0 stay distinct only if the schema says so
+        through its declared values; in practice declare one form).
+        """
+        label = f"character field {field_name!r}" if field_name else "character field"
+        if value is None:
+            raise ValueError(f"{label} must not be null")
+        if self.type == "string":
+            if not isinstance(value, str):
+                raise ValueError(f"{label} must be a string")
+            if self.min_value is not None and len(value) < self.min_value:
+                raise ValueError(f"{label} is shorter than min length {self.min_value}")
+            if self.max_value is not None and len(value) > self.max_value:
+                raise ValueError(f"{label} is longer than max length {self.max_value}")
+            return value
+        if self.type == "int":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{label} must be an integer")
+            if self.min_value is not None and value < self.min_value:
+                raise ValueError(f"{label} must be >= {self.min_value}")
+            if self.max_value is not None and value > self.max_value:
+                raise ValueError(f"{label} must be <= {self.max_value}")
+            return value
+        if self.type == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{label} must be a finite number")
+            out = float(value)
+            if self.min_value is not None and out < self.min_value:
+                raise ValueError(f"{label} must be >= {self.min_value}")
+            if self.max_value is not None and out > self.max_value:
+                raise ValueError(f"{label} must be <= {self.max_value}")
+            return out
+        if self.type == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(f"{label} must be a boolean")
+            return value
+        if self.type == "enum":
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{label} must be a finite enum value")
+            if value not in (self.values or []):
+                raise ValueError(f"{label} must be one of {self.values}")
+            return value
+        if self.type in ("vec2", "vec3"):
+            want = 2 if self.type == "vec2" else 3
+            if not isinstance(value, (list, tuple)) or len(value) != want:
+                raise ValueError(f"{label} must contain exactly {want} numbers")
+            out = []
+            for v in value:
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                    raise ValueError(f"{label} must contain finite numbers")
+                f = float(v)
+                if self.min_value is not None and f < self.min_value:
+                    raise ValueError(f"{label} components must be >= {self.min_value}")
+                if self.max_value is not None and f > self.max_value:
+                    raise ValueError(f"{label} components must be <= {self.max_value}")
+                out.append(f)
+            return out
+        raise ValueError(f"{label} has unknown type {self.type!r}")
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "CharacterField":
+        if not isinstance(payload, dict):
+            raise ValueError("character field must be an object")
+        raw = dict(payload)
+        if "type" not in raw:
+            raise ValueError("character field must declare type")
+        min_value = raw.get("min", raw.get("min_value", raw.get("minimum")))
+        max_value = raw.get("max", raw.get("max_value", raw.get("maximum")))
+        authority = raw.get("authority", "client")
+        if "server_only" in raw:
+            authority = "server" if bool(raw["server_only"]) else "client"
+        values = raw.get("values", raw.get("enum_values"))
+        if values is not None and not isinstance(values, list):
+            raise ValueError("character field values must be a list")
+        unknown = set(raw) - {
+            "type", "required", "default", "min", "min_value", "minimum",
+            "max", "max_value", "maximum", "values", "enum_values",
+            "authority", "server_only", "semantic",
+        }
+        if unknown:
+            raise ValueError("unsupported character field keys: " + ", ".join(sorted(unknown)))
+        return cls(
+            type=str(raw["type"]),
+            required=bool(raw.get("required", False)),
+            default=raw.get("default"),
+            min_value=None if min_value is None else float(min_value),
+            max_value=None if max_value is None else float(max_value),
+            values=list(values) if values is not None else None,
+            authority=authority,  # type: ignore[arg-type]
+            semantic=raw.get("semantic"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"type": self.type, "required": bool(self.required),
+                               "authority": self.authority}
+        if self.default is not None:
+            out["default"] = self.default
+        if self.min_value is not None:
+            out["min"] = self.min_value
+        if self.max_value is not None:
+            out["max"] = self.max_value
+        if self.values is not None:
+            out["values"] = list(self.values)
+        if self.semantic is not None:
+            out["semantic"] = self.semantic
+        return out
+
+
+@dataclass
+class CharacterSchema:
+    """The declared shape of per-player state for one ``game_id``.
+
+    ``version`` is part of the schema identity: same fields but a
+    different version is a mismatch (409). To change a schema, use a
+    new ``game_id`` or wait for the old game data to expire.
+    ``allow_unknown`` defaults to False (closed schema). A game may
+    opt into an open schema, but then unknown fields are relayed
+    unvalidated, so this is for prototyping only.
+    """
+
+    version: int = 1
+    fields: Dict[str, CharacterField] = field(default_factory=dict)
+    allow_unknown: bool = False
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 1:
+            raise ValueError("character_schema.version must be an integer >= 1")
+        if not isinstance(self.fields, dict):
+            raise ValueError("character_schema.fields must be an object")
+        if len(self.fields) > MAX_CHARACTER_SCHEMA_FIELDS:
+            raise ValueError(f"character_schema has too many fields (max {MAX_CHARACTER_SCHEMA_FIELDS})")
+        if not isinstance(self.allow_unknown, bool):
+            raise ValueError("character_schema.allow_unknown must be a boolean")
+        for name, f in self.fields.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("character_schema field names must be non-empty strings")
+            if name in _RESERVED_CHARACTER_FIELDS:
+                raise ValueError(f"character_schema field name {name!r} is reserved")
+            if not isinstance(f, CharacterField):
+                raise ValueError(f"character_schema field {name!r} must be a CharacterField")
+            f.validate()
+
+    def is_empty(self) -> bool:
+        return not self.fields
+
+    def canonical_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "fields": {name: self.fields[name].to_dict() for name in sorted(self.fields)},
+            "allow_unknown": bool(self.allow_unknown),
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.canonical_dict()
+
+    def fingerprint_hash(self) -> str:
+        """Canonical hash for GameSessionConfig.fingerprint().
+
+        Sorting and compact separators make the hash independent of
+        key order and whitespace in the client's JSON.
+        """
+        payload = json.dumps(self.canonical_dict(), sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "CharacterSchema":
+        if payload is None:
+            return cls()
+        if isinstance(payload, CharacterSchema):
+            return payload
+        if not isinstance(payload, dict):
+            raise ValueError("character_schema must be an object")
+        raw = dict(payload)
+        unknown = set(raw) - {"version", "fields", "properties", "allow_unknown", "allowUnknown"}
+        if unknown:
+            raise ValueError("unsupported character_schema keys: " + ", ".join(sorted(unknown)))
+        version = raw.get("version", 1)
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("character_schema.version must be an integer")
+        fields_raw = raw.get("fields", raw.get("properties", {}))
+        if not isinstance(fields_raw, dict):
+            raise ValueError("character_schema.fields must be an object")
+        fields = {str(name): CharacterField.from_payload(spec) for name, spec in fields_raw.items()}
+        allow_unknown = raw.get("allow_unknown", raw.get("allowUnknown", False))
+        return cls(version=version, fields=fields, allow_unknown=bool(allow_unknown))
+
+    def _check_size(self, patch: Dict[str, Any]) -> None:
+        if len(patch) > MAX_CHARACTER_STATE_KEYS:
+            raise ValueError(f"character state has too many keys (max {MAX_CHARACTER_STATE_KEYS})")
+        try:
+            size = len(json.dumps(patch, default=str).encode("utf-8"))
+        except (TypeError, ValueError):
+            raise ValueError("character state must be JSON-encodable")
+        if size > MAX_CHARACTER_STATE_BYTES:
+            raise ValueError(f"character state too large (max {MAX_CHARACTER_STATE_BYTES} bytes)")
+
+    def validate_client_patch(self, patch: Any) -> Tuple[Dict[str, Any], List[str]]:
+        """Validate a client PATCH. Returns (accepted, dropped_server_fields).
+
+        Patches are partial: missing ``required`` fields are NOT an
+        error here. Required-ness is enforced on the merged full state
+        (see ``validate_full_state``), so a client can send one field
+        at a time. Server-authoritative fields are dropped, never
+        broadcast. Unknown fields are rejected unless ``allow_unknown``.
+        """
+        if patch is None:
+            return {}, []
+        if not isinstance(patch, dict):
+            raise ValueError("character state must be an object")
+        self._check_size(patch)
+        accepted: Dict[str, Any] = {}
+        dropped: List[str] = []
+        for name, value in patch.items():
+            spec = self.fields.get(str(name))
+            if spec is None:
+                if self.allow_unknown:
+                    accepted[str(name)] = value
+                    continue
+                raise ValueError(f"unknown character field: {name}")
+            if spec.authority == "server":
+                dropped.append(str(name))
+                continue
+            accepted[str(name)] = spec.validate_value(value, field_name=str(name))
+        return accepted, dropped
+
+    def validate_server_patch(self, patch: Any) -> Dict[str, Any]:
+        """Validate a server-side patch. Server code may set any field.
+
+        Used by the registry's internal server-set path only. The
+        synchronizer is still a client and must go through
+        ``validate_client_patch``.
+        """
+        if patch is None:
+            return {}
+        if not isinstance(patch, dict):
+            raise ValueError("character state must be an object")
+        self._check_size(patch)
+        accepted: Dict[str, Any] = {}
+        for name, value in patch.items():
+            spec = self.fields.get(str(name))
+            if spec is None:
+                if self.allow_unknown:
+                    accepted[str(name)] = value
+                    continue
+                raise ValueError(f"unknown character field: {name}")
+            accepted[str(name)] = spec.validate_value(value, field_name=str(name))
+        return accepted
+
+    def apply_defaults(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Return ``state`` with defaults filled for missing fields."""
+        out = dict(state)
+        for name, spec in self.fields.items():
+            if name not in out and spec.default is not None:
+                out[name] = spec.validate_value(spec.default, field_name=name)
+        return out
+
+    def validate_full_state(self, state: Any) -> Dict[str, Any]:
+        """Validate a complete merged state: defaults, types, required.
+
+        The registry calls this after merging a patch into the stored
+        full state. It is the only place ``required`` is enforced.
+        """
+        if not isinstance(state, dict):
+            raise ValueError("character state must be an object")
+        self._check_size(state)
+        out: Dict[str, Any] = {}
+        for name, value in state.items():
+            spec = self.fields.get(str(name))
+            if spec is None:
+                if self.allow_unknown:
+                    out[str(name)] = value
+                    continue
+                raise ValueError(f"unknown character field: {name}")
+            out[str(name)] = spec.validate_value(value, field_name=str(name))
+        out = self.apply_defaults(out)
+        missing = [name for name, spec in self.fields.items()
+                   if spec.required and name not in out]
+        if missing:
+            raise ValueError("missing required character fields: " + ", ".join(sorted(missing)))
+        return out
+
+
 @dataclass
 class GameSessionConfig:
     """Everything an application declares when it first connects."""
@@ -216,6 +616,10 @@ class GameSessionConfig:
     matchmaking: MatchmakingConfig = field(default_factory=MatchmakingConfig)
     turn: TurnConfig = field(default_factory=TurnConfig)
     authority: AuthorityConfig = field(default_factory=AuthorityConfig)
+    # Schema-declared character state for this game_id. Empty schema
+    # means the game sends no character state (e.g. tic-tac-toe).
+    # The first join stores it; later joins must match it exactly.
+    character_schema: CharacterSchema = field(default_factory=CharacterSchema)
     # Public rooms can be discovered / matchmade; private rooms need a code.
     visibility: Literal["public", "private"] = "public"
     room_code: Optional[str] = None  # join key for private rooms
@@ -242,7 +646,8 @@ class GameSessionConfig:
     # Seconds an empty game keeps its data before lazy deletion.
     # Default 300 (5 min). 0 == keep forever. Deletion is event-driven:
     # checked on the next packet from ANY client, never by a timer.
-    # A reconnect within the TTL resumes the same game (same gems).
+    # A reconnect within the TTL resumes the same game (same gems,
+    # same character schema).
     empty_game_ttl_sec: float = 300.0
 
     def validate(self) -> None:
@@ -268,6 +673,11 @@ class GameSessionConfig:
             raise ValueError("config.empty_game_ttl_sec must be a number")
         if not 0 <= self.empty_game_ttl_sec <= 86400:
             raise ValueError("config.empty_game_ttl_sec must be in [0, 86400]")
+        if self.character_schema is None:
+            self.character_schema = CharacterSchema()
+        if isinstance(self.character_schema, dict):
+            self.character_schema = CharacterSchema.from_payload(self.character_schema)
+        self.character_schema.validate()
         self.turn.validate()
         if self.requires_matchmaking:
             self.matchmaking.enabled = True
@@ -280,9 +690,13 @@ class GameSessionConfig:
         disconnection_time_sec is deliberately NOT part of the bucket:
         enforcement is per-client, so two players with different budgets
         can still match.
+        character_schema is part of the bucket via its canonical hash,
+        so two clients that declared different schemas never matchmake
+        together. The registry additionally enforces one schema per
+        game_id (see CharacterSchema): a later join for the same
+        game_id with a different schema gets 409, even if its
+        fingerprint would otherwise differ.
         """
-        import json
-
         return json.dumps({
             "game_id": self.game_id,
             "max": self.max_players_per_room,
@@ -293,6 +707,8 @@ class GameSessionConfig:
             "region": self.matchmaking.region,
             "visibility": self.visibility,
             "custom_rules": self.custom_rules,
+            "character_schema": self.character_schema.fingerprint_hash()
+            if self.character_schema is not None else CharacterSchema().fingerprint_hash(),
         }, sort_keys=True, default=str)
 
     @classmethod
@@ -308,6 +724,9 @@ class GameSessionConfig:
         Accepts ``disconnectionTime`` / ``disconnection_time_sec`` /
         ``disconnection_time`` / ``disconnect_timeout_sec`` /
         ``disconnectTimeout`` for the disconnect budget.
+        Accepts ``character_schema`` / ``characterSchema`` /
+        ``character_state_schema`` / ``characterStateSchema`` for the
+        character schema. Omitting it declares an empty schema.
         """
         if payload is None:
             return cls()
@@ -336,6 +755,19 @@ class GameSessionConfig:
                              "turn_based", "turnBased", default=False)
         if isinstance(requires_turn, dict):
             requires_turn = requires_turn.get("enabled", False)
+
+        # Character schema — top-level config field.
+        schema_raw = _pop("character_schema", "characterSchema",
+                          "character_state_schema", "characterStateSchema",
+                          default=None)
+        if schema_raw is None:
+            character_schema = CharacterSchema()
+        elif isinstance(schema_raw, CharacterSchema):
+            character_schema = schema_raw
+        elif isinstance(schema_raw, dict):
+            character_schema = CharacterSchema.from_payload(schema_raw)
+        else:
+            raise ValueError("config.character_schema must be an object")
 
         # Disconnection budget — top-level config field.
         raw_disconnect = _pop(
@@ -402,6 +834,7 @@ class GameSessionConfig:
                     "resource_types", authority_raw.get("resourceTypes", ["*"]))],
                 allow_client_claims=bool(authority_raw.get("allow_client_claims", True)),
             ),
+            character_schema=character_schema,
             visibility=str(_pop("visibility", default="public")),
             room_code=_pop("room_code", "roomCode", default=None),
             custom_rules=dict(_pop("custom_rules", "customRules", default={}) or {}),
@@ -468,6 +901,11 @@ class JoinResponse:
     turn_order: List[str] = field(default_factory=list)
     skill_source: SkillSource = "client_reported"
     config: Optional[GameSessionConfig] = None
+    # Effective character schema for this game_id, echoed so a client
+    # that declared the wrong schema can fail fast. This is the stored
+    # schema, not necessarily the one the client declared: on a 409
+    # the registry returns the stored schema instead of a JoinResponse.
+    character_schema: Optional[CharacterSchema] = None
     # Echo of the effective disconnect budget for this client.
     disconnection_time_sec: float = 60.0
 
@@ -650,8 +1088,10 @@ class TurnValidator(Protocol):
 
 # ---------- No game-specific types below this line ----------
 # Game state is an opaque ``Dict[str, Any]`` carried in
-# ``TurnState.state`` / ``TurnAction.proposed_state``. The server
-# treats it as opaque. The only game-specific code is (a) an optional
+# ``TurnState.state`` / ``TurnAction.proposed_state``. Character state
+# is schema-declared (see CharacterSchema above): the server validates
+# it against the game's schema without understanding what any field
+# means. The only game-specific code is (a) an optional
 # ``TurnValidator`` for a game that wants server-side adjudication, and
 # (b) demo clients, which live outside the API entirely.
 
@@ -661,77 +1101,142 @@ class TurnValidator(Protocol):
 
 @dataclass
 class CharacterState:
-    """Authoritative per-player state, owned by client_id."""
+    """Per-player state, owned by client_id.
+
+    ``state`` is a PATCH in flight and a full state at rest. A client
+    PATCH may be partial: it can send one field at a time, and
+    ``required`` is not enforced on a patch. The registry merges the
+    patch into the stored full state, fills defaults, then enforces
+    ``required`` on the merged result (see
+    ``CharacterSchema.validate_full_state``).
+
+    ``source`` is ``"client"`` for client patches and ``"server"`` for
+    patches applied by server code (for example a server-authoritative
+    ``score`` set on gem collection). Clients must not set ``source``;
+    the server stamps it. The synchronizer is still a client.
+    """
+
     clientId: str
-    characterModelId: str = "default"
-    position: List[float] = field(default_factory=lambda: [0.0, 0.0])  # [x, y]
-    velocity: List[float] = field(default_factory=lambda: [0.0, 0.0])  # [vx, vy]
-    animationState: str = "stand"  # stand, run, jump, fall
-    animationFrame: float = 0.0
-    isJumping: bool = False
-    facing: int = 1  # -1 left, 1 right
-    score: int = 0
-    onGround: bool = False
-    health: int = 100  # 0..100, rendered as health bar on top in top-down demo
+    state: Dict[str, Any] = field(default_factory=dict)
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    source: Literal["client", "server"] = "client"
 
     @classmethod
-    def from_payload(cls, payload: Dict[str, Any]):
+    def from_payload(
+        cls, payload: Dict[str, Any], schema: "CharacterSchema",
+        *, source: Literal["client", "server"] = "client",
+    ) -> Tuple["CharacterState", List[str]]:
+        """Parse one character update against ``schema``.
+
+        Returns (character_state, dropped_server_fields). A client
+        patch that includes a server-authoritative field has that
+        field dropped, never broadcast. A server patch may set any
+        field. Unknown fields are rejected unless the schema opts
+        into ``allow_unknown``.
+
+        Legacy shapes are rejected outright: top-level ``position``,
+        ``health``, ``velocity``, ``score``, ``metadata``, ``pos``,
+        and friends are not fields. Send them inside ``state`` and
+        declare them in the schema.
+
+        ``timestamp`` from the client is ignored: the server stamps
+        receipt time. ``source`` from the client is ignored: the
+        caller decides ``source``.
+        """
         if not isinstance(payload, dict):
             raise ValueError("character update must be an object")
-        allowed = set(cls.__dataclass_fields__)
+        if schema is None:
+            raise ValueError("character update requires a CharacterSchema")
+        allowed = {"clientId", "state", "timestamp", "source"}
         unknown = set(payload) - allowed
         if unknown:
-            raise ValueError("unsupported character fields: " + ", ".join(sorted(unknown)))
-        if "metadata" in payload and not isinstance(payload["metadata"], dict):
-            raise ValueError("metadata must be an object")
+            legacy = sorted(set(payload) & {
+                "position", "health", "velocity", "score", "metadata", "pos",
+                "characterModelId", "animationState", "animationFrame",
+                "isJumping", "facing", "onGround",
+            })
+            hint = ""
+            if legacy:
+                hint = (
+                    f" Legacy top-level fields {legacy} are no longer supported: "
+                    "declare them in character_schema and send them inside state."
+                )
+            raise ValueError("unsupported character fields: " + ", ".join(sorted(unknown)) + hint)
         if not isinstance(payload.get("clientId"), str) or not payload["clientId"]:
             raise ValueError("clientId must be a non-empty string")
-        values = dict(payload)
-        for name in ("position", "velocity"):
-            vector = values.get(name, [0.0, 0.0])
-            if not isinstance(vector, (list, tuple)) or len(vector) != 2:
-                raise ValueError(name + " must contain exactly two numbers")
-            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
-                   for v in vector):
-                raise ValueError(name + " must contain finite numbers")
-            values[name] = [float(v) for v in vector]
-        if "facing" in values and (isinstance(values["facing"], bool) or not isinstance(values["facing"], int)
-                                   or values["facing"] not in (-1, 1)):
-            raise ValueError("facing must be -1 or 1")
-        if "score" in values and (isinstance(values["score"], bool) or not isinstance(values["score"], int)):
-            raise ValueError("score must be an integer")
-        if "health" in values:
-            h = values["health"]
-            if isinstance(h, bool) or not isinstance(h, int) or not 0 <= h <= 100:
-                raise ValueError("health must be an integer in [0, 100]")
-        for name in ("isJumping", "onGround"):
-            if name in values and not isinstance(values[name], bool):
-                raise ValueError(name + " must be a boolean")
-        for name in ("characterModelId", "animationState"):
-            if name in values and not isinstance(values[name], str):
-                raise ValueError(name + " must be a string")
-        if "animationFrame" in values:
-            frame = values["animationFrame"]
-            if isinstance(frame, bool) or not isinstance(frame, (int, float)) or not math.isfinite(frame):
-                raise ValueError("animationFrame must be a finite number")
-            values["animationFrame"] = float(frame)
-        if "timestamp" in values and (isinstance(values["timestamp"], bool) or not isinstance(values["timestamp"], int)):
-            raise ValueError("timestamp must be an integer")
-        return cls(**values)
+        state_raw = payload.get("state", {})
+        if state_raw is None:
+            state_raw = {}
+        if not isinstance(state_raw, dict):
+            raise ValueError("state must be an object")
+        if source == "server":
+            accepted = schema.validate_server_patch(state_raw)
+            dropped: List[str] = []
+        else:
+            accepted, dropped = schema.validate_client_patch(state_raw)
+        return cls(
+            clientId=payload["clientId"],
+            state=accepted,
+            timestamp=int(time.time() * 1000),
+            source=source,
+        ), dropped
 
-    def to_dict(self):
-        payload = asdict(self)
-        if not self.metadata:
-            payload.pop("metadata")
-        return payload
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "clientId": self.clientId,
+            "state": dict(self.state),
+            "timestamp": self.timestamp,
+            "source": self.source,
+        }
 
 
 @dataclass
 class CharacterStateUpdate:
     updates: List[CharacterState]
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+
+    @classmethod
+    def from_payload(
+        cls, payload: Any, schema: "CharacterSchema",
+        *, source: Literal["client", "server"] = "client",
+    ) -> Tuple["CharacterStateUpdate", Dict[str, List[str]]]:
+        """Parse a PATCH /character-state body against ``schema``.
+
+        Returns (update, dropped_server_fields_by_client_id). The
+        caller (registry) merges each patch into the stored full
+        state, fills defaults, enforces ``required``, and broadcasts
+        the merged result. The PATCH timestamp is ignored; the server
+        stamps receipt time.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("character-state update must be an object")
+        raw_updates = payload.get("updates", [])
+        if not isinstance(raw_updates, list):
+            raise ValueError("character-state updates must be a list")
+        updates: List[CharacterState] = []
+        dropped: Dict[str, List[str]] = {}
+        for item in raw_updates:
+            parsed, item_dropped = CharacterState.from_payload(item, schema, source=source)
+            updates.append(parsed)
+            if item_dropped:
+                dropped[parsed.clientId] = item_dropped
+        return cls(updates=updates, timestamp=int(time.time() * 1000)), dropped
+
+
+@dataclass
+class CharacterStateUpdateResponse:
+    """PATCH /character-state response.
+
+    ``dropped_server_fields`` maps clientId to the server-authoritative
+    field names that were dropped from that client's patch. Dropped
+    fields are never broadcast, so the client can debug the drop
+    without the room breaking.
+    """
+
+    ok: bool = True
+    accepted: List[CharacterState] = field(default_factory=list)
+    dropped_server_fields: Dict[str, List[str]] = field(default_factory=dict)
+    server_timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
 @dataclass
@@ -847,10 +1352,11 @@ class LightState:
 
 @dataclass
 class Capabilities:
-    protocolVersion: int = 2
+    protocolVersion: int = 1
     transport: str = "datastar-sse"
     features: Dict[str, bool] = field(default_factory=lambda: {
-        "characterState": True, "itemState": True, "itemAuthority": True,
+        "characterState": True, "characterSchema": True,
+        "itemState": True, "itemAuthority": True,
         "envAuthority": True, "synchronizer": True,
         "matchmaking": True, "turnBased": True,
         "skillProviders": True, "rooms": True, "customGames": True,

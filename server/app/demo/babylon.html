@@ -7,29 +7,62 @@
 <!--
   babylon.html — realtime multiplayer demo for MATCH (github.com/EricEisaman/match)
   Drop this file into server/app/demo/babylon.html and serve it at /demo/babylon
-  (same as top-down.html at /demo/top-down).
+  (same route shape as /demo/top-down — different game: this one is
+  3D third-person, not top-down).
 
   WHAT IT IS
-  - Babylon.js 3D version of top-down.html. Same MATCH protocol, same API:
+  - Babylon.js 3D third-person demo. Same MATCH protocol, same API:
     join -> stream (SSE) -> character-state / item-state / heartbeat -> leave.
   - Local hero is character-basic.glb (WASD tank controls, idle / walk / run).
-    idle / walk / run). Every player is a clone of the SAME character-basic.glb
-    from one hidden basis. No primitives.
+    Every player is a clone of the SAME character-basic.glb from one hidden
+    basis. No primitives.
   - Name bar + health bar: Babylon.GUI panels linked to each character mesh
     (see createCharacterUI). Health is demo-only relayed state: the server
     broadcasts it, it does not simulate combat. Use -10 HP / Heal to see
     your bar update on other clients.
 
+  CHARACTER STATE — SCHEMA-DECLARED (protocol v1)
+  - There are NO top-level position / health / score / metadata fields
+    anymore. The ONLY universal top-level character field is `clientId`.
+    Everything else lives inside `state` and must be declared in
+    `config.character_schema` on join (see CHARACTER_SCHEMA below).
+  - This demo declares:
+        position: vec2, required, client   (server 2000-space [x, y])
+        health:   int 0..100, required, client
+        score:    int >= 0, SERVER authority, default 0
+        name:     string, client
+        color:    string, client
+        yaw:      number, client
+        anim:     string, client  ("stand" | "run" | "walkBack")
+  - The FIRST client to join `babylon-demo` stores that schema for the
+    whole game_id. A later join declaring a different schema gets
+    409 + the stored schema; this demo retries once with the stored
+    schema. To change the schema, use a new game_id or wait for the
+    empty-game TTL to clear the old game data.
+  - `score` is SERVER-authoritative: this client NEVER sends it.
+    A patch containing `score` would have it dropped (see
+    `dropped_server_fields` in the PATCH response). The server
+    increments `score` on gem collection and broadcasts the updated
+    full state with `source: "server"` — that broadcast is the ONLY
+    way this client learns its new score. Do NOT increment locally
+    on collection (the old demo did; that double-counted).
+  - PATCHes are partial: a patch may send one field at a time.
+    The server merges it into the stored full state, fills defaults,
+    then enforces `required` on the merged result. This demo sends
+    the full client-owned set on every move, so the merged state is
+    always complete.
+
   COORDINATES — READ THIS
-  - The server speaks one 2D space: 2000 x 2000 (top-down.html's WORLD_W/H).
-    character-state `position` and gem `pos` are [x, y] in that space.
+  - The server speaks one 2D space: 2000 x 2000 (the shared server space).
+    character-state `state.position` and gem `pos` are [x, y] in that space.
   - This demo maps that space onto an 80 x 80 Babylon ground:
         x3d = (x2d / 2000 - 0.5) * 80
         z3d = (y2d / 2000 - 0.5) * 80
     We SEND 2000-space coords and CONVERT inbound coords, so a Babylon
-    client and a top-down client in the same environment would agree.
-  - Server spawns gems for `babylon-demo` separately — same 24-gem logic
-    as top-down, but its OWN game_id / env (`babylon-demo:gem-N`),
+    client and any other client in the same environment would agree.
+  - Server spawns gems for `babylon-demo` separately — same
+    server-spawned 24-gem logic, but its OWN game_id / env
+    (`babylon-demo:gem-N`),
     NOT top-down-demo's gems. This client renders only what the server
     sends — it never spawns gems locally.
 
@@ -57,10 +90,13 @@
 <body>
 <h1>Babylon.js — Realtime Demo</h1>
 <p class="panel">
-  3D version of the top-down demo. Move with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys
+  3D third-person demo. Move with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys
   (tank controls: <kbd>W</kbd>/<kbd>S</kbd> forward/back, <kbd>A</kbd>/<kbd>D</kbd> turn),
   Orbit with the mouse. Walk over a <code>gem</code> to collect it.
   Gems are <code>item-state</code> — <code>updates</code> spawn them, <code>collections</code> collect them.
+  Character state is schema-declared: <code>state: {position, health, name, color, yaw, anim}</code>,
+  and <code>score</code> is server-authoritative — the server increments it on collection,
+  this client never sends it.
   Every player gets a floating <b>name bar + health bar</b> above their head.
   No timers anywhere: movement is <code>keydown</code>/<code>keyup</code> + render loop,
   disconnect is enforced by the server on the next packet.
@@ -105,15 +141,34 @@
 <script>
 // ---------------------------------------------------------------------------
 // Babylon demo — realtime, event-driven only. No timers.
-// Same MATCH API as top-down.html. Server-authoritative gems.
+// Same MATCH API. Server-authoritative gems + score. 3D third-person, not top-down.
 // ---------------------------------------------------------------------------
-const WORLD_2D = 2000;          // server coordinate space (shared with top-down)
+const WORLD_2D = 2000;          // server coordinate space (shared 2000-space)
 const WORLD_3D = 80;            // Babylon ground size
 const SPEED_FWD = 7;            // units/sec (3D)
 const SPEED_BACK = 2.5;
 const ROT_SPEED = 2.4;          // rad/sec
-const GEM_COLLECT_DIST = 1.25;  // 3D units ~= 28px in top-down space
+const GEM_COLLECT_DIST = 1.25;  // 3D units ~= 28 units in 2000-space
 const GEM_Y = 0.7;
+
+// Character schema declared on join. First join for game_id "babylon-demo"
+// stores it server-side; later joins must match it exactly (409 otherwise).
+// score is server-authoritative: NEVER send it in a character-state PATCH.
+const CHARACTER_SCHEMA = {
+  version: 1,
+  fields: {
+    position: { type: "vec2", required: true, authority: "client", semantic: "position" },
+    health: { type: "int", required: true, min: 0, max: 100, authority: "client", semantic: "health" },
+    score: { type: "int", authority: "server", default: 0, min: 0, semantic: "score" },
+    name: { type: "string", authority: "client", semantic: "name" },
+    color: { type: "string", authority: "client" },
+    yaw: { type: "number", authority: "client" },
+    anim: { type: "string", authority: "client" },
+  },
+};
+// Effective schema: ours, unless the server answers 409 with the stored
+// schema for this game_id — then we retry once with that stored schema.
+let effectiveSchema = CHARACTER_SCHEMA;
 
 let clientId = null, sessionId = null, roomId = null;
 let isSynchronizer = false;
@@ -143,9 +198,10 @@ function colorFor(id) {
 // --- coordinate mapping: server 2000-space <-> Babylon 80-space -----------
 function to3D(x2d, y2d) { return { x: (x2d / WORLD_2D - 0.5) * WORLD_3D, z: (y2d / WORLD_2D - 0.5) * WORLD_3D }; }
 function to2D(x3d, z3d) { return { x: (x3d / WORLD_3D + 0.5) * WORLD_2D, y: (z3d / WORLD_3D + 0.5) * WORLD_2D }; }
-// Inbound pos may be [x2d,y2d] (server / top-down) or [x3d,z3d] (a 3D client
-// sending raw Babylon coords). Heuristic: 3D coords live in -40..40,
-// 2D coords live in 0..2000 (gems spawn 80..1920, players near 1000).
+// Inbound pos may be [x2d,y2d] (server) or [x3d,z3d] (a legacy
+// 3D client sending raw Babylon coords). Heuristic: 3D coords live in
+// -40..40, 2D coords live in 0..2000 (gems spawn 80..1920, players near
+// 1000). Schema clients always send 2D; this only saves old mixed rooms.
 function normalizePos(pos) {
   if (!Array.isArray(pos) || pos.length < 2) return { x2d: WORLD_2D / 2, y2d: WORLD_2D / 2 };
   const [a, b] = pos;
@@ -448,6 +504,10 @@ function attachCloneToRemote(p) {
   p.ui.setHealth(p.health);
   playRemoteAnim(p, p.anim);
 }
+// Partial-safe: server broadcasts may be partial (e.g. a server-only
+// score update has state {score} and no position). Only fields present
+// in `data` overwrite the stored value; missing fields keep their
+// previous value. A brand-new remote starts from defaults.
 function upsertRemote(id, data) {
   let p = players.get(id);
   if (!p) {
@@ -459,12 +519,17 @@ function upsertRemote(id, data) {
     if (modelReady) attachCloneToRemote(p);
     else pendingRemoteIds.add(id);
   }
-  if (data.name && data.name !== p.name) { p.name = data.name; if (p.ui) p.ui.setName(data.name); }
+  if (data.name !== undefined && data.name !== p.name) { p.name = data.name; if (p.ui) p.ui.setName(data.name); }
   if (typeof data.health === "number" && data.health !== p.health) { p.health = data.health; if (p.ui) p.ui.setHealth(data.health); }
   if (data.color) p.color = data.color;
   if (typeof data.score === "number") p.score = data.score;
-  if (typeof data.yaw === "number") p.yaw = data.yaw;
-  if (data.anim && data.anim !== p.anim) { p.anim = data.anim; if (p.cloneAttached) playRemoteAnim(p, p.anim); }
+  if (typeof data.yaw === "number") { p.yaw = data.yaw; p.root.rotation.y = p.yaw; }
+  if (data.anim !== undefined && data.anim !== p.anim) { p.anim = data.anim; if (p.cloneAttached) playRemoteAnim(p, p.anim); }
+  if (typeof data.x2d === "number" && typeof data.y2d === "number") {
+    p.x2d = data.x2d; p.y2d = data.y2d;
+    const t = to3D(p.x2d, p.y2d);
+    p.root.position.set(t.x, 0, t.z);
+  }
   return p;
 }
 function removeRemote(id) {
@@ -496,7 +561,7 @@ function removeGem(instanceId) {
 }
 
 // ---------------------------------------------------------------------------
-// Multiplayer — same API as top-down.html
+// Multiplayer — schema-declared character state (see header comment)
 // ---------------------------------------------------------------------------
 async function join() {
   const name = $("name").value || "player";
@@ -509,7 +574,7 @@ async function join() {
   const c = to2D(start.x, start.z); me.x = c.x; me.y = c.y;
   if (heroUI) { heroUI.setName(name + " (you)"); heroUI.setHealth(100); }
   $("hudHealth").textContent = "HP: 100";
-  const res = await api("/api/multiplayer/join", { method: "POST", body: JSON.stringify({
+  const postJoin = (schema) => api("/api/multiplayer/join", { method: "POST", body: JSON.stringify({
     environment_name: "babylon-demo",
     character_name: name,
     game_id: "babylon-demo",
@@ -526,10 +591,21 @@ async function join() {
       disconnection_time_sec: disconnectSec,
       empty_game_ttl_sec: 300,
       authority: { scopes: ["items", "environment", "character_state"], resource_types: ["*"], allow_client_claims: true },
+      character_schema: schema,
     },
   })});
-  const data = await res.json();
+  let res = await postJoin(CHARACTER_SCHEMA);
+  let data = await res.json().catch(() => ({}));
+  if (res.status === 409 && data.character_schema) {
+    // Another client already stored a different schema for this
+    // game_id. Rejoin once with the stored schema (protocol fail-fast).
+    log("join: schema mismatch, retrying with server-stored schema");
+    effectiveSchema = data.character_schema;
+    res = await postJoin(effectiveSchema);
+    data = await res.json().catch(() => ({}));
+  }
   if (!res.ok) { log("join failed: " + JSON.stringify(data)); return; }
+  if (data.character_schema) effectiveSchema = data.character_schema;
   clientId = data.client_id; sessionId = data.session_id; roomId = data.room_id || null;
   isSynchronizer = !!data.is_synchronizer;
   joined = true;
@@ -565,6 +641,9 @@ async function collectGem(instanceId) {
   })});
   lastPacketMs = performance.now();
   if (!res.ok) { pendingCollections.delete(instanceId); log("collect failed: " + res.status); }
+  // No local score change here: the server increments the
+  // server-authoritative score and broadcasts the updated character
+  // state (source "server"). applyMp() applies that broadcast.
 }
 async function sendHeartbeat() {
   if (!clientId) return;
@@ -579,14 +658,27 @@ async function sendCharacterState(force) {
   const now = performance.now();
   if (!force && now - lastSentMs < 50) return;
   lastSentMs = now; lastPacketMs = now;
+  // Schema shape: {clientId, state: {...}}. Only client-owned fields.
+  // NEVER send score — it is server-authoritative and would be dropped.
+  // NEVER send top-level position / health / metadata — the server
+  // rejects legacy shapes with 422.
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, position: [me.x, me.y], health: me.health,
-      metadata: { schemaVersion: 1, name: me.name, color: me.color, yaw: me.yaw,
-        animationState: me.anim, score: me.score, characterModelId: "character-basic",
-        velocity: [me.vx, me.vy], facing: me.yaw >= 0 ? 1 : -1 } }],
+    updates: [{ clientId, state: {
+      position: [me.x, me.y],
+      health: me.health,
+      name: me.name,
+      color: me.color,
+      yaw: me.yaw,
+      anim: me.anim,
+    } }],
     timestamp: Date.now(),
   })});
   if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
+  else if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    log("character-state rejected (" + res.status + "): " + JSON.stringify(d));
+    if (d.dropped_server_fields) log("dropped_server_fields: " + JSON.stringify(d.dropped_server_fields));
+  }
 }
 function handleStreamData(raw) {
   try {
@@ -606,6 +698,21 @@ function connectStream() {
   stream.onmessage = (ev) => handleStreamData(ev.data);
   stream.onerror = () => { log("stream error — EventSource will retry"); };
 }
+// Apply one broadcast character entry {clientId, state, source}.
+// Own entries are the score channel: the server's score broadcast
+// (source "server") is the only place our score changes. Never
+// overwrite our own position from our own echo — we already have it.
+function applySelfCharacter(st) {
+  if (typeof st.score === "number" && st.score !== me.score) {
+    me.score = st.score;
+    $("hudScore").textContent = `Gems: ${me.score}`;
+  }
+  if (typeof st.health === "number" && st.health !== me.health) {
+    me.health = st.health;
+    if (heroUI) heroUI.setHealth(me.health);
+    $("hudHealth").textContent = `HP: ${me.health}`;
+  }
+}
 function applyMp(mp) {
   if (!mp) return;
   if (mp.connection) {
@@ -616,23 +723,23 @@ function applyMp(mp) {
     }
     if (mp.connection.roomId) roomId = mp.connection.roomId;
   }
+  if (mp.characterSchema) effectiveSchema = mp.characterSchema;
   if (Array.isArray(mp.characters)) {
     for (const c of mp.characters) {
-      if (!c || !c.clientId || c.clientId === clientId) continue;
-      const meta = c.metadata || {};
-      const pos = normalizePos(c.position || c.pos || meta.position);
-      const p = upsertRemote(c.clientId, {
-        name: meta.name || "player",
-        color: meta.color || colorFor(c.clientId),
-        health: c.health ?? meta.health ?? 100,
-        score: meta.score ?? c.score ?? 0,
-        yaw: typeof meta.yaw === "number" ? meta.yaw : 0,
-        anim: meta.animationState || c.animationState || "stand",
+      if (!c || !c.clientId) continue;
+      const st = c.state || {};
+      if (c.clientId === clientId) { applySelfCharacter(st); continue; }
+      const pos = Array.isArray(st.position) ? normalizePos(st.position) : null;
+      upsertRemote(c.clientId, {
+        name: st.name,
+        color: st.color,
+        health: st.health,
+        score: st.score,
+        yaw: st.yaw,
+        anim: st.anim,
+        x2d: pos ? pos.x2d : undefined,
+        y2d: pos ? pos.y2d : undefined,
       });
-      p.x2d = pos.x2d; p.y2d = pos.y2d;
-      const t = to3D(pos.x2d, pos.y2d);
-      p.root.position.set(t.x, 0, t.z);
-      p.root.rotation.y = p.yaw;
     }
   }
   if (mp.items) {
@@ -640,7 +747,7 @@ function applyMp(mp) {
       for (const row of mp.items.updates) {
         if (!row || !row.instanceId) continue;
         if (row.isCollected) { removeGem(row.instanceId); pendingCollections.delete(row.instanceId); continue; }
-        const p = normalizePos(row.pos || row.position || row.metadata?.pos);
+        const p = normalizePos(row.pos || row.position);
         const ex = gems.get(row.instanceId);
         if (ex) { const t = to3D(p.x2d, p.y2d); ex.mesh.position.set(t.x, GEM_Y, t.z); ex.x2d = p.x2d; ex.y2d = p.y2d; }
         else addGem(row.instanceId, p.x2d, p.y2d);
@@ -649,9 +756,11 @@ function applyMp(mp) {
     if (Array.isArray(mp.items.collections)) {
       for (const coll of mp.items.collections) {
         if (!coll || !coll.instanceId) continue;
-        const wasMine = coll.collectedByClientId === clientId;
+        // Score is NOT updated here. The server already broadcast (or
+        // is about to broadcast) the character-state-update with the
+        // incremented server-authoritative score; applySelfCharacter
+        // applies it. Incrementing here would double-count.
         removeGem(coll.instanceId); pendingCollections.delete(coll.instanceId);
-        if (wasMine) { me.score += 1; $("hudScore").textContent = `Gems: ${me.score}`; sendCharacterState(true); }
       }
     }
   }

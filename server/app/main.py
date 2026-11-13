@@ -22,7 +22,7 @@ from .api.health import router as health_router
 from .api.chat_proxy import router as chat_proxy_router
 from .settings import settings
 from .multiplayer.protocol import (
-    AuthorityConfig, Capabilities, CharacterState,
+    AuthorityConfig, Capabilities, CharacterSchema, CharacterState,
     ClientReportedSkillProvider, GameSessionConfig,
     JoinRequest, JoinResponse,
     MatchmakingConfig, SkillProvider, SkillRating,
@@ -291,8 +291,25 @@ class MultiplayerRegistry:
         # env -> TTL (sec) captured from the last client that was in it.
         # Default 300s (5 min). Overridable per-game via config.
         self.env_empty_ttl_sec: Dict[str, float] = {}
+        # --- Character schema (one per game_id, stored with game data) ---
+        # game_id -> stored CharacterSchema. First join stores it; later
+        # joins must match it exactly or get 409 plus the stored schema.
+        # Same schema for all rooms of the same game, including private
+        # rooms. Kept while the game is empty inside empty_game_ttl_sec,
+        # deleted with game data when the TTL expires.
+        self.game_character_schemas: Dict[str, CharacterSchema] = {}
+        # client_id -> server-set fields that arrived before the client
+        # had a full stored state (e.g. score set on gem collection
+        # before the first character patch). Merged into the full state
+        # on the next client patch, then cleared.
+        self._character_server_pending: Dict[str, Dict[str, Any]] = {}
+        # env <-> game_id bookkeeping so _delete_game_data_locked can
+        # delete the schema for the game(s) that used that env, once no
+        # env still uses them and no client with that game_id remains.
+        self._env_to_game_ids: Dict[str, set] = {}
+        self._game_to_envs: Dict[str, set] = {}
         # --- Server-authoritative game data ---
-        # top-down-demo: server spawns gems, not the synchronizer client.
+        # Gem games: server spawns gems, not the synchronizer client.
         # Per-env gem counter so instanceIds never collide / get reused.
         self._top_down_gem_counter: Dict[str, int] = {}
         # How many live gems the server keeps on the field.
@@ -307,6 +324,17 @@ class MultiplayerRegistry:
         self.running = False
         print("[SCS-MP-SYNC] Registry stopped")
 
+    # -- helpers ---------------------------------------------------------
+    def _schema_for(self, session: ClientSession) -> CharacterSchema:
+        """Stored schema for a session's game_id, falling back to the
+        session's own config (pre-join / legacy paths)."""
+        stored = self.game_character_schemas.get(session.game_id)
+        if stored is not None:
+            return stored
+        if session.config is not None and session.config.character_schema is not None:
+            return session.config.character_schema
+        return CharacterSchema()
+
     # -- server-authoritative game data + empty-game cleanup --------
     # The server owns game data from the moment the FIRST player for a
     # particular game connects. Clients never spawn authoritative state:
@@ -318,7 +346,18 @@ class MultiplayerRegistry:
     # packet from ANY client. No background task, no sleep, no timer:
     # deletion only happens because a packet arrived.
     def _is_top_down_game(self, game_id: str = "", env_name: str = "") -> bool:
+        # Strictly the 2D top-down game. Babylon is NOT a top-down
+        # game — it is a 3D third-person game that happens to share
+        # the gem mechanic. Do not add it here.
         return game_id == "top-down-demo" or env_name == "top-down-demo"
+
+    def _is_gem_game(self, game_id: str = "", env_name: str = "") -> bool:
+        # Games whose field is server-spawned gems (24 live, respawn
+        # on collect, server-authoritative score). top-down-demo is
+        # the 2D top-down one; babylon-demo is the 3D third-person
+        # one. Each gets its OWN env (top-down-demo:gem-N vs
+        # babylon-demo:gem-N) — they never share gems.
+        return game_id in ("top-down-demo", "babylon-demo") or env_name in ("top-down-demo", "babylon-demo")
 
     def _delete_game_data_locked(self, env_name: str, now_ms: int) -> List[str]:
         """Delete ALL stored data for one empty game (env). Caller holds lock."""
@@ -351,6 +390,10 @@ class MultiplayerRegistry:
         for cid in [cid for cid, st in list(self.character_cache.items())
                     if cid in self.clients and self.clients[cid].environment == env_name]:
             self.character_cache.pop(cid, None)
+        # Server-pending fields for clients in this env.
+        for cid in [cid for cid in list(self._character_server_pending)
+                    if cid in self.clients and self.clients[cid].environment == env_name]:
+            self._character_server_pending.pop(cid, None)
         # Rooms with no players that belong to this env.
         for rid in [rid for rid, room in list(self.rooms.items())
                     if not room.player_ids and (
@@ -368,6 +411,23 @@ class MultiplayerRegistry:
         self._top_down_gem_counter.pop(env_name, None)
         self.env_empty_since.pop(env_name, None)
         self.env_empty_ttl_sec.pop(env_name, None)
+        # Character schema for the game(s) that used this env. The schema
+        # lives with game data: it is deleted here, with everything else,
+        # once the TTL has expired. It survives while the game is empty
+        # inside the TTL because this method is only called after the TTL.
+        _game_ids = list(self._env_to_game_ids.get(env_name, set()))
+        if env_name in self.game_character_schemas and env_name not in _game_ids:
+            _game_ids.append(env_name)
+        self._env_to_game_ids.pop(env_name, None)
+        for gid in _game_ids:
+            envs = self._game_to_envs.get(gid)
+            if envs is not None:
+                envs.discard(env_name)
+                if envs:
+                    continue
+                self._game_to_envs.pop(gid, None)
+            if not any(c.game_id == gid for c in self.clients.values()):
+                self.game_character_schemas.pop(gid, None)
         return list(dict.fromkeys(deleted))
 
     def _sweep_empty_games_locked(self, now_ms: int) -> List[str]:
@@ -388,7 +448,7 @@ class MultiplayerRegistry:
         return deleted_envs
 
     def _spawn_top_down_gems_locked(self, env_name: str, count: int, now_ms: int) -> List[Dict[str, Any]]:
-        """Server-spawn `count` gems for top-down-demo. Caller holds lock."""
+        """Server-spawn `count` gems for one gem-game env. Caller holds lock."""
         import random as _random
         out: List[Dict[str, Any]] = []
         for _ in range(max(0, count)):
@@ -416,12 +476,13 @@ class MultiplayerRegistry:
     def _ensure_game_data_locked(self, env_name: str, game_id: str, now_ms: int) -> List[Dict[str, Any]]:
         """Ensure server-owned data exists for a game. Caller holds lock.
 
-        top-down-demo: keep TOP_DOWN_GEM_TARGET live gems. Other games:
-        no-op today (their state is character + turn + custom, already
-        server-held). Called on first join, on env switch, and after
-        every collection (to top up).
+        Gem games (top-down-demo, babylon-demo): keep
+        TOP_DOWN_GEM_TARGET live gems. Other games: no-op today (their
+        state is character + turn + custom, already server-held).
+        Called on first join, on env switch, and after every collection
+        (to top up).
         """
-        if not self._is_top_down_game(game_id, env_name):
+        if not self._is_gem_game(game_id, env_name):
             return []
         live = sum(1 for v in self.item_cache.values()
                    if isinstance(v, dict) and v.get("environment") == env_name
@@ -496,6 +557,31 @@ class MultiplayerRegistry:
             # New arrival is itself a packet: sweep stale clients first
             # so existing_clients / synchronizer election are accurate.
             await self._sweep_expired_locked(now)
+            # --- Character schema: one per game_id, first join wins. ---
+            # Must run before any session is created, so a rejected join
+            # leaves no session, no synchronizer, and no room behind.
+            declared = config.character_schema or CharacterSchema()
+            stored = self.game_character_schemas.get(req.game_id)
+            if stored is None:
+                self.game_character_schemas[req.game_id] = declared
+                stored = declared
+            elif stored.canonical_dict() != declared.canonical_dict():
+                # Different schema for the same game_id, even with a
+                # different room_code / room_id. Do not create a second
+                # bucket. Return the stored schema so the client can
+                # rejoin with it.
+                raise HTTPException(409, detail={
+                    "error": "character_schema_mismatch",
+                    "game_id": req.game_id,
+                    "character_schema": stored.to_dict(),
+                    "message": "game_id already has a character schema; rejoin with the stored schema",
+                })
+            # Effective schema for this join is the stored one.
+            config.character_schema = stored
+            # Track env <-> game_id so empty-game deletion can delete
+            # the schema with the game data once the TTL expires.
+            self._env_to_game_ids.setdefault(req.environment_name, set()).add(req.game_id)
+            self._game_to_envs.setdefault(req.game_id, set()).add(req.environment_name)
             client_id = uuid.uuid4().hex[:8]
             session_id = uuid.uuid4().hex[:16]
             skill = await self.skill_provider.resolve_skill(
@@ -526,7 +612,7 @@ class MultiplayerRegistry:
                 _auth_ev = {}
             # Server owns game data from the FIRST join. Spawn it now so
             # the joining client's bootstrap already contains the field.
-            # For top-down-demo this creates 24 gems; for other games no-op.
+            # For gem games this creates 24 gems; for other games no-op.
             try:
                 self._ensure_game_data_locked(req.environment_name, req.game_id, now)
             except Exception:
@@ -549,6 +635,7 @@ class MultiplayerRegistry:
                                     queue_position=pos if status == "queued" else None,
                                     seat=after.seat if after else None,
                                     skill_source=skill.source, config=config,
+                                    character_schema=stored,
                                     disconnection_time_sec=config.disconnection_time_sec)
             room = self._get_or_create_direct_room(req, config)
             seat = len(room.player_ids)
@@ -563,6 +650,7 @@ class MultiplayerRegistry:
                                 room_id=room.room_id, game_id=req.game_id,
                                 match_status="ready", seat=seat, player_index=seat,
                                 skill_source=skill.source, config=config,
+                                character_schema=stored,
                                 disconnection_time_sec=config.disconnection_time_sec)
 
     async def _try_fill_queues(self, fingerprint: str) -> None:
@@ -666,7 +754,7 @@ class MultiplayerRegistry:
         events = self.authority.client_leaves(client_id)
         for ev in events:
             if ev["type"] == "env-authority-changed":
-                await self._broadcast_signal("env-item-authority-changed", ev,
+                await self._broadcast_signal("env-authority-changed", ev,
                                              environment=ev.get("environmentName", session.environment))
             elif ev["type"] == "item-authority-changed":
                 await self._broadcast_signal("item-authority-changed", ev, environment=session.environment)
@@ -689,11 +777,14 @@ class MultiplayerRegistry:
             if not room.player_ids:
                 self.rooms.pop(room.room_id, None)
         # Character state for this client is gone with the client.
+        # The schema stays: it lives with game data, not with the client.
         self.character_cache.pop(client_id, None)
+        self._character_server_pending.pop(client_id, None)
         # If this env is now empty, start the 5-minute grace clock.
         # Data is NOT deleted here; it is deleted lazily by
         # _sweep_empty_games_locked on the next packet after the TTL.
-        # A reconnect within 5 min resumes the same game.
+        # A reconnect within 5 min resumes the same game, including the
+        # same character schema.
         _remaining = [c for c in self.clients.values() if c.environment == session.environment]
         if not _remaining:
             ttl = 300.0
@@ -743,11 +834,17 @@ class MultiplayerRegistry:
                                    for s in self.clients.values()) - 1
             authority_events = self.authority.client_leaves(client_id)
             self.character_cache.pop(client_id, None)
+            self._character_server_pending.pop(client_id, None)
             self.freshness.client_leaves(previous_environment, client_id)
             client.environment = environment
             # New env is no longer empty; old env may have just become empty.
+            # The character schema is per game_id, not per env, so it
+            # survives the switch. Track the new env <-> game_id mapping
+            # so empty-game deletion still finds the schema later.
             self.env_empty_since.pop(environment, None)
             self.env_empty_ttl_sec.pop(environment, None)
+            self._env_to_game_ids.setdefault(environment, set()).add(client.game_id)
+            self._game_to_envs.setdefault(client.game_id, set()).add(environment)
             _old_remaining = [c for c in self.clients.values() if c.environment == previous_environment]
             if not _old_remaining:
                 self.env_empty_since[previous_environment] = _now_ms()
@@ -840,6 +937,14 @@ class MultiplayerRegistry:
         now = _now_ms()
         env_name = client.environment
         room = self.rooms.get(client.room_id) if client.room_id else None
+        # Stored schema for this game_id, so a late joiner / resync learns
+        # the schema before sending any character patch. This is the
+        # first bootstrap event on GET /stream.
+        schema = self.game_character_schemas.get(client.game_id)
+        if schema is None and client.config is not None and client.config.character_schema is not None:
+            schema = client.config.character_schema
+        if schema is None:
+            schema = CharacterSchema()
         mp: Dict[str, Any] = {
             "timestamp": now,
             "connection": {"clientId": client.client_id, "sessionId": client.session_id,
@@ -848,6 +953,7 @@ class MultiplayerRegistry:
                            "matchStatus": client.match_status,
                            "disconnectionTimeSec": client.disconnection_time_sec,
                            "emptyGameTtlSec": self.env_empty_ttl_sec.get(env_name, 300.0)},
+            "characterSchema": schema.to_dict(),
             "clients": [{"clientId": c.client_id, "character": c.character_name,
                          "environment": c.environment}
                         for c in self.clients.values() if c.environment == env_name],
@@ -991,7 +1097,16 @@ class MultiplayerRegistry:
         return config.authority.covers(scope, resource_type)
 
     # -- state handlers ------------------------
-    async def handle_character_state(self, client_id: str, updates: List[Dict]):
+    async def handle_character_state(self, client_id: str, updates: List[Dict]) -> Dict[str, Any]:
+        """PATCH /character-state. Caller is the route; lock held here.
+
+        Each patch is validated against the stored schema for this
+        game_id (client source: server fields dropped, unknown fields
+        rejected), merged into the stored full state, validated as a
+        full state (defaults filled, required enforced), stored, and
+        broadcast as the merged result. The response echoes dropped
+        server fields so the client can debug the drop.
+        """
         async with self._lock:
             now = _now_ms()
             sess = self.clients.get(client_id)
@@ -1002,21 +1117,135 @@ class MultiplayerRegistry:
                 raise HTTPException(403, "disconnected: timeout")
             self._touch(sess, now)
             await self._sweep_expired_locked(now, exclude=client_id)
-            parsed_updates = []
+            schema = self._schema_for(sess)
+            if sess.game_id not in self.game_character_schemas:
+                self.game_character_schemas[sess.game_id] = schema
+            parsed_updates: List[CharacterState] = []
+            dropped_all: Dict[str, List[str]] = {}
             for update in updates:
                 try:
-                    state = CharacterState.from_payload(update)
+                    state, dropped = CharacterState.from_payload(update, schema, source="client")
                 except (TypeError, ValueError) as ex:
                     raise HTTPException(422, str(ex))
                 if state.clientId != client_id:
                     raise HTTPException(403, f"clientId mismatch: {state.clientId} != {client_id}")
-                parsed_updates.append(state)
-            for state in parsed_updates:
-                self.character_cache[client_id] = state
+                if dropped:
+                    dropped_all[state.clientId] = dropped
+                # Merge: pending server fields, then stored full state,
+                # then this patch. Client patches never contain server
+                # fields (dropped above), so they cannot clobber them.
+                base: Dict[str, Any] = {}
+                base.update(self._character_server_pending.get(client_id, {}))
+                existing = self.character_cache.get(client_id)
+                if existing is not None:
+                    base.update(existing.state)
+                base.update(state.state)
+                try:
+                    merged = schema.validate_full_state(base)
+                except ValueError as ex:
+                    raise HTTPException(422, str(ex))
+                merged_state = CharacterState(clientId=client_id, state=merged,
+                                              timestamp=now, source="client")
+                self.character_cache[client_id] = merged_state
+                self._character_server_pending.pop(client_id, None)
+                parsed_updates.append(merged_state)
+            if parsed_updates:
+                await self._broadcast_signal("character-state-update",
+                                            {"updates": [s.to_dict() for s in parsed_updates],
+                                             "timestamp": now},
+                                            environment=sess.environment)
+            return {"ok": True,
+                    "accepted": [s.to_dict() for s in parsed_updates],
+                    "dropped_server_fields": dropped_all,
+                    "server_timestamp": now}
+
+    # -- server-set character path (server code only, never HTTP) -----
+    # The synchronizer is still a client. It must go through
+    # handle_character_state, which drops server fields. Only server
+    # code calls these methods, e.g. gem collection setting score.
+    async def _apply_server_character_patch_locked(
+        self, client_id: str, patch: Dict[str, Any], now_ms: int,
+    ) -> Optional[CharacterState]:
+        """Apply a server patch. Caller holds self._lock.
+
+        Validates via validate_server_patch, merges into the stored
+        full state, validates the merged full state, stores it, and
+        broadcasts with source server. If the client has no stored
+        full state yet, the fields are stashed in
+        _character_server_pending and broadcast as a partial update;
+        they are merged into the full state on the next client patch.
+        """
+        session = self.clients.get(client_id)
+        if session is None:
+            return None
+        schema = self._schema_for(session)
+        accepted = schema.validate_server_patch(patch)
+        existing = self.character_cache.get(client_id)
+        if existing is not None:
+            merged = schema.validate_full_state({**existing.state, **accepted})
+            new_state = CharacterState(clientId=client_id, state=merged,
+                                       timestamp=now_ms, source="server")
+            self.character_cache[client_id] = new_state
+            self._character_server_pending.pop(client_id, None)
             await self._broadcast_signal("character-state-update",
-                                        {"updates": [s.to_dict() for s in parsed_updates],
-                                         "timestamp": _now_ms()},
-                                        environment=sess.environment)
+                                        {"updates": [new_state.to_dict()],
+                                         "timestamp": now_ms},
+                                        environment=session.environment)
+            return new_state
+        pending = dict(self._character_server_pending.get(client_id, {}))
+        pending.update(accepted)
+        self._character_server_pending[client_id] = pending
+        partial = CharacterState(clientId=client_id, state=dict(pending),
+                                 timestamp=now_ms, source="server")
+        await self._broadcast_signal("character-state-update",
+                                    {"updates": [partial.to_dict()],
+                                     "timestamp": now_ms},
+                                    environment=session.environment)
+        return partial
+
+    async def set_server_character_state(
+        self, client_id: str, patch: Dict[str, Any],
+    ) -> Optional[CharacterState]:
+        """Server-code entry point for setting character fields.
+
+        Not exposed over HTTP. Game adapters / turn validators call
+        this, e.g. to set a server-authoritative score. Raises
+        ValueError on an invalid patch (a server bug, not a client
+        error, so it is not turned into a 422 here).
+        """
+        async with self._lock:
+            return await self._apply_server_character_patch_locked(client_id, patch, _now_ms())
+
+    async def _increment_server_score_locked(
+        self, client_id: str, now_ms: int, amount: int = 1,
+    ) -> Optional[CharacterState]:
+        """Increment a server-authoritative score field. Caller holds lock.
+
+        No-op when the game's schema has no score field, or when score
+        is client-authoritative. Used by gem collection in
+        handle_item_state.
+        """
+        session = self.clients.get(client_id)
+        if session is None:
+            return None
+        schema = self._schema_for(session)
+        spec = schema.fields.get("score")
+        if spec is None or spec.authority != "server":
+            return None
+        existing = self.character_cache.get(client_id)
+        if existing is not None:
+            current = existing.state.get("score", 0)
+        else:
+            current = self._character_server_pending.get(client_id, {}).get("score", 0)
+        if isinstance(current, bool) or not isinstance(current, (int, float)):
+            current = 0
+        new_score = int(current) + amount
+        if spec.max_value is not None:
+            new_score = min(new_score, int(spec.max_value))
+        if spec.min_value is not None:
+            new_score = max(new_score, int(spec.min_value))
+        return await self._apply_server_character_patch_locked(
+            client_id, {"score": new_score}, now_ms)
 
     async def handle_item_state(self, client_id: str, updates: List[Dict], collections: List[Dict]):
         async with self._lock:
@@ -1049,7 +1278,7 @@ class MultiplayerRegistry:
                 # must be dropped, otherwise it would duplicate the
                 # server field. Only collections are accepted for gems.
                 _cached_pre = self.item_cache.get(iid)
-                if self._is_top_down_game(session.game_id, env_name):
+                if self._is_gem_game(session.game_id, env_name):
                     if (_cached_pre and _cached_pre.get("server_spawned")) or row.get("itemName") in ("gem", ""):
                         continue
                 resolved = self.authority.get_resolved_owner(iid, env_name)
@@ -1120,9 +1349,17 @@ class MultiplayerRegistry:
                 self.dirty_filter.cache[iid] = dict(self.item_cache[iid])
                 # Server keeps the top-down field full: one new gem per
                 # collection, included in the SAME broadcast as the collection.
-                if self._is_top_down_game(session.game_id, env_name):
+                if self._is_gem_game(session.game_id, env_name):
                     _respawned = self._spawn_top_down_gems_locked(env_name, 1, now)
                     accepted_updates.extend(_respawned)
+                    # Server-authoritative score: gem collection sets it.
+                    # This goes through the server-set path, never through
+                    # a client patch, and broadcasts with source server.
+                    # No-op when the schema has no server score field.
+                    try:
+                        await self._increment_server_score_locked(client_id, now)
+                    except Exception:
+                        pass
             if accepted_updates or accepted_collections:
                 await self._broadcast_signal("item-state-update",
                                             {"updates": accepted_updates, "collections": accepted_collections,
@@ -1313,24 +1550,38 @@ def _join_request_from_body(body: "JoinBody") -> JoinRequest:
         config = GameSessionConfig.from_payload(raw["config"])
     elif any(raw.get(k) is not None for k in (
             "requires_matchmaking", "requires_turn_based", "max_players_per_room",
-            "min_players_per_room", "matchmaking", "turn", "authority")):
+            "min_players_per_room", "matchmaking", "turn", "authority",
+            "character_schema", "characterSchema")):
         # Flat form: config fields sent alongside environment_name.
-        config = GameSessionConfig.from_payload({
+        # character_schema may arrive as snake_case or camelCase.
+        # Only pass keys the client actually set: from_payload() treats
+        # a present None (e.g. max_players_per_room=None) as a value
+        # and int(None) crashes, so None keys must be omitted.
+        flat_schema = raw.get("character_schema") or raw.get("characterSchema")
+        flat: Dict[str, Any] = {
             "game_id": raw.get("game_id") or raw.get("environment_name") or "default",
-            "requires_matchmaking": raw.get("requires_matchmaking", False),
-            "requires_turn_based": raw.get("requires_turn_based", False),
-            "max_players_per_room": raw.get("max_players_per_room"),
-            "min_players_per_room": raw.get("min_players_per_room"),
-            "matchmaking": raw.get("matchmaking") or {},
-            "turn": raw.get("turn") or {},
-            "authority": raw.get("authority") or {},
-        })
+        }
+        for _k in ("requires_matchmaking", "requires_turn_based",
+                   "max_players_per_room", "min_players_per_room",
+                   "matchmaking", "turn", "authority"):
+            if raw.get(_k) is not None:
+                flat[_k] = raw.get(_k)
+        if flat_schema is not None:
+            flat["character_schema"] = flat_schema
+        config = GameSessionConfig.from_payload(flat)
     # Flat disconnectionTime alongside the body (without nested config).
-    if config is None and raw.get("disconnectionTime") is not None:
-        config = GameSessionConfig.from_payload({
+    if config is None and (raw.get("disconnectionTime") is not None
+                           or raw.get("character_schema") is not None
+                           or raw.get("characterSchema") is not None):
+        flat2: Dict[str, Any] = {
             "game_id": raw.get("game_id") or raw.get("environment_name") or "default",
-            "disconnectionTime": raw.get("disconnectionTime"),
-        })
+        }
+        if raw.get("disconnectionTime") is not None:
+            flat2["disconnectionTime"] = raw.get("disconnectionTime")
+        flat_schema2 = raw.get("character_schema") or raw.get("characterSchema")
+        if flat_schema2 is not None:
+            flat2["character_schema"] = flat_schema2
+        config = GameSessionConfig.from_payload(flat2)
     game_id = raw.get("game_id") or raw.get("environment_name") or "default"
     return JoinRequest(
         environment_name=raw.get("environment_name") or game_id,
@@ -1365,6 +1616,9 @@ class JoinBody(BaseModel):
     matchmaking: Optional[Dict[str, Any]] = None
     turn: Optional[Dict[str, Any]] = None
     authority: Optional[Any] = None  # list of scopes or {scopes, resource_types, ...}
+    # Flat character schema, snake_case or camelCase.
+    character_schema: Optional[Dict[str, Any]] = None
+    characterSchema: Optional[Dict[str, Any]] = None
     room_id: Optional[str] = None
     room_code: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -1390,6 +1644,7 @@ async def join(request: Request, body: JoinBody):
             "queue_position": res.queue_position, "seat": res.seat,
             "player_index": res.player_index, "turn_order": res.turn_order,
             "skill_source": res.skill_source,
+            "character_schema": res.character_schema.to_dict() if res.character_schema else None,
             "disconnection_time_sec": res.disconnection_time_sec}
 
 
@@ -1493,8 +1748,7 @@ async def character_state(request: Request, body: CharacterStateBody):
     if not cid:
         raise HTTPException(400, "Missing X-Client-ID")
     registry: MultiplayerRegistry = request.app.state.mp
-    await registry.handle_character_state(cid, body.updates)
-    return {"ok": True}
+    return await registry.handle_character_state(cid, body.updates)
 
 
 class ItemStateBody(BaseModel):
@@ -1817,4 +2071,3 @@ _demo_rest = [r for r in app.routes if getattr(r, "path", "") not in ("/demo/hul
 # FIX: app.routes is a read-only property (no setter) — assigning it crashes on import.
 # Mutate the underlying list in place instead. Same order, no route edited/removed.
 app.router.routes[:] = _demo_new + _demo_rest
-
