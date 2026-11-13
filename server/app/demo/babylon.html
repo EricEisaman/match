@@ -327,6 +327,7 @@ heroRoot.position.set(0, 0, 0);
 let heroMesh = null;
 let heroUI = null;
 let animGroups = {};
+let animList = [];
 let currentAnim = "";
 let heroLoaded = false;
 let modelContainer = null;
@@ -349,13 +350,17 @@ function makeClone(parent) {
   root.position.set(0, 0, 0);
   const mesh = firstMeshOf(root);
   const groups = {};
+  const list = [];
   for (const g of entries.animationGroups) {
     try { g.stop(); } catch (e) {}
     g.name = g.name.replace("Clone of ", "");
-    groups[g.name.toLowerCase()] = g;
-    groups[g.name] = g;
+    list.push(g);
+    const lower = g.name.toLowerCase();
+    groups[lower] = g;
+    const stripped = lower.split("|").pop().split(":").pop().trim();
+    if (stripped) groups[stripped] = g;
   }
-  return { root, mesh, animGroups: groups };
+  return { root, mesh, animGroups: groups, animList: list };
 }
 BABYLON.SceneLoader.LoadAssetContainerAsync("https://dl.dropbox.com/s/ygkvz5mnqfmw238/", "character-basic.glb", scene).then((container) => {
   modelContainer = container;
@@ -364,6 +369,7 @@ BABYLON.SceneLoader.LoadAssetContainerAsync("https://dl.dropbox.com/s/ygkvz5mnqf
   heroMesh = heroClone.mesh;
   heroLoaded = true;
   animGroups = heroClone.animGroups;
+  animList = heroClone.animList;
   playAnim("idle");
   ensureHeroUI();
   log("character-basic loaded: " + Object.keys(animGroups).join(", "));
@@ -376,12 +382,23 @@ BABYLON.SceneLoader.LoadAssetContainerAsync("https://dl.dropbox.com/s/ygkvz5mnqf
   log("character-basic failed to load: " + (e && e.message ? e.message : e));
 });
 
+function resolveAnim(groups, list, wanted) {
+  const key = String(wanted).toLowerCase();
+  if (groups[key]) return groups[key];
+  for (const g of list || []) {
+    const n = String(g.name || "").toLowerCase();
+    if (n === key || n.split("|").pop() === key || n.includes(key)) return g;
+  }
+  const idx = key === "idle" ? 0 : key === "walk" ? 1 : key === "run" ? 2 : 0;
+  return (list || [])[Math.min(idx, (list || []).length - 1)] || null;
+}
 function playAnim(name) {
   const key = String(name).toLowerCase();
   if (currentAnim === key) return;
-  const g = animGroups[key] || animGroups[name];
-  if (!g) { currentAnim = key; return; }
-  for (const k of Object.keys(animGroups)) { if (k.toLowerCase() !== key) { try { animGroups[k].stop(); } catch (e) {} } }
+  const g = resolveAnim(animGroups, animList, key);
+  if (!g) return;
+  const seen = new Set();
+  for (const gg of animList) { if (gg !== g && !seen.has(gg)) { seen.add(gg); try { gg.stop(); } catch (e) {} } }
   g.start(true, 1.0, g.from, g.to, false);
   currentAnim = key;
 }
@@ -413,10 +430,11 @@ function animNameForRemote(anim) {
 function playRemoteAnim(p, anim) {
   const target = animNameForRemote(anim).toLowerCase();
   if (p.animName === target) return;
-  p.animName = target;
-  const g = p.animGroups ? (p.animGroups[target] || p.animGroups[anim]) : null;
+  const g = resolveAnim(p.animGroups || {}, p.animList || [], target);
   if (!g) return;
-  for (const k of Object.keys(p.animGroups || {})) { if (k.toLowerCase() !== target) { try { p.animGroups[k].stop(); } catch (e) {} } }
+  p.animName = target;
+  const seen = new Set();
+  for (const gg of p.animList || []) { if (gg !== g && !seen.has(gg)) { seen.add(gg); try { gg.stop(); } catch (e) {} } }
   g.start(true, 1.0, g.from, g.to, false);
 }
 function attachCloneToRemote(p) {
@@ -425,6 +443,7 @@ function attachCloneToRemote(p) {
   p.clone = c.root;
   p.mesh = c.mesh;
   p.animGroups = c.animGroups;
+  p.animList = c.animList || [];
   p.cloneAttached = true;
   p.ui = createCharacterUI(c.mesh, p.name, 100, false);
   p.ui.setHealth(p.health);
@@ -436,7 +455,7 @@ function upsertRemote(id, data) {
     const root = new BABYLON.TransformNode("player_" + id, scene);
     p = { id, x2d: WORLD_2D / 2, y2d: WORLD_2D / 2, health: 100, score: 0, name: data.name || "player",
           color: data.color || colorFor(id), yaw: 0, anim: "stand", animName: "", animGroups: {},
-          root, clone: null, mesh: null, ui: null, cloneAttached: false };
+          root, clone: null, mesh: null, ui: null, cloneAttached: false, animList: [] };
     players.set(id, p);
     if (modelReady) attachCloneToRemote(p);
     else pendingRemoteIds.add(id);
@@ -563,8 +582,8 @@ async function sendCharacterState(force) {
   lastSentMs = now; lastPacketMs = now;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
     updates: [{ clientId, position: [me.x, me.y],
-      animationState: me.anim, health: me.health, score: me.score,
-      metadata: { name: me.name, color: me.color, yaw: me.yaw } }],
+      animationState: me.anim, animation_state: me.anim, anim: me.anim, health: me.health, score: me.score,
+      metadata: { name: me.name, color: me.color, yaw: me.yaw, anim: me.anim, animationState: me.anim } }],
     timestamp: Date.now(),
   })});
   if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
@@ -604,13 +623,14 @@ function applyMp(mp) {
       const pos = normalizePos(c.position || c.pos);
       const yaw = typeof meta.yaw === "number" ? meta.yaw
         : typeof c.facing === "number" ? c.facing * Math.PI / 2 : 0;
+      const rawAnim = c.animationState ?? c.animation_state ?? c.anim ?? c.animation ?? meta.animationState ?? meta.anim ?? meta.animationState ?? "stand";
       const p = upsertRemote(c.clientId, {
         name: meta.name || c.characterModelId || "player",
         color: meta.color || colorFor(c.clientId),
         health: c.health ?? meta.health ?? 100,
         score: c.score ?? 0,
         yaw,
-        anim: c.animationState || "stand",
+        anim: rawAnim,
       });
       p.x2d = pos.x2d; p.y2d = pos.y2d;
       const t = to3D(pos.x2d, pos.y2d);
@@ -663,6 +683,7 @@ function setHealth(h) {
 
 // --- per-frame: movement + camera + gems + keep-alive (render loop only) ---
 let lastFrameMs = performance.now();
+let lastSentAnim = null;
 scene.onBeforeRenderObservable.add(() => {
   const now = performance.now();
   const dt = Math.min(0.05, (now - lastFrameMs) / 1000 || 0.016);
@@ -716,7 +737,9 @@ scene.onBeforeRenderObservable.add(() => {
   }
 
   const moved = speed !== 0 || turn !== 0;
-  if (moved) sendCharacterState(false);
+  const animChanged = me.anim !== lastSentAnim;
+  if (animChanged) { lastSentAnim = me.anim; sendCharacterState(true); }
+  else if (moved) sendCharacterState(false);
   else if (now - lastPacketMs > 10000) sendHeartbeat();
 });
 
