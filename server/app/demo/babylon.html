@@ -28,11 +28,10 @@
         z3d = (y2d / 2000 - 0.5) * 80
     We SEND 2000-space coords and CONVERT inbound coords, so a Babylon
     client and a top-down client in the same environment would agree.
-  - If your server only spawns gems for `top-down-demo`, add `babylon-demo`
-    to that same spawn list (same 24 gems, same 2000-space positions,
-    respawn 1 per collection). Until then this client renders only what
-    the server sends — it never spawns gems locally, exactly like top-down.
-    That was the bug where only the spawner saw gems.
+  - Server spawns gems for `babylon-demo` separately — same 24-gem logic
+    as top-down, but its OWN game_id / env (`babylon-demo:gem-N`),
+    NOT top-down-demo's gems. This client renders only what the server
+    sends — it never spawns gems locally.
 
   NO TIMERS: movement is keydown/keyup + engine render loop,
   disconnect is enforced lazily by the server on the next packet.
@@ -581,10 +580,10 @@ async function sendCharacterState(force) {
   if (!force && now - lastSentMs < 50) return;
   lastSentMs = now; lastPacketMs = now;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, characterModelId: "character-basic", position: [me.x, me.y], pos: [me.x, me.y],
-      velocity: [me.vx, me.vy], animationState: me.anim, animationFrame: 0, isJumping: false,
-      facing: me.yaw, score: me.score, health: me.health, onGround: true, timestamp: Date.now(),
-      metadata: { health: me.health, name: me.name, color: me.color, yaw: me.yaw } }],
+    updates: [{ clientId, position: [me.x, me.y], health: me.health,
+      metadata: { schemaVersion: 1, name: me.name, color: me.color, yaw: me.yaw,
+        animationState: me.anim, score: me.score, characterModelId: "character-basic",
+        velocity: [me.vx, me.vy], facing: me.yaw >= 0 ? 1 : -1 } }],
     timestamp: Date.now(),
   })});
   if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
@@ -621,15 +620,14 @@ function applyMp(mp) {
     for (const c of mp.characters) {
       if (!c || !c.clientId || c.clientId === clientId) continue;
       const meta = c.metadata || {};
-      const pos = normalizePos(c.position || c.pos);
-      const yaw = typeof c.facing === "number" ? c.facing : (typeof meta.yaw === "number" ? meta.yaw : (typeof c.rotation === "number" ? c.rotation : 0));
+      const pos = normalizePos(c.position || c.pos || meta.position);
       const p = upsertRemote(c.clientId, {
-        name: meta.name || c.characterModelId || "player",
+        name: meta.name || "player",
         color: meta.color || colorFor(c.clientId),
         health: c.health ?? meta.health ?? 100,
-        score: c.score ?? 0,
-        yaw,
-        anim: c.animationState || "stand",
+        score: meta.score ?? c.score ?? 0,
+        yaw: typeof meta.yaw === "number" ? meta.yaw : 0,
+        anim: meta.animationState || c.animationState || "stand",
       });
       p.x2d = pos.x2d; p.y2d = pos.y2d;
       const t = to3D(pos.x2d, pos.y2d);
@@ -642,7 +640,7 @@ function applyMp(mp) {
       for (const row of mp.items.updates) {
         if (!row || !row.instanceId) continue;
         if (row.isCollected) { removeGem(row.instanceId); pendingCollections.delete(row.instanceId); continue; }
-        const p = normalizePos(row.pos || row.position);
+        const p = normalizePos(row.pos || row.position || row.metadata?.pos);
         const ex = gems.get(row.instanceId);
         if (ex) { const t = to3D(p.x2d, p.y2d); ex.mesh.position.set(t.x, GEM_Y, t.z); ex.x2d = p.x2d; ex.y2d = p.y2d; }
         else addGem(row.instanceId, p.x2d, p.y2d);
