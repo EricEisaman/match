@@ -319,7 +319,7 @@ function createCharacterUI(mesh, characterName, maxHealth, isMe) {
 }
 
 // ---------------------------------------------------------------------------
-// Hero — Playground HVGirl, parented to a TransformNode we actually move.
+// Hero — character-basic, parented to a TransformNode we actually move.
 // Basis first, hidden. Local = clone 0, remotes = successive clones.
 // ---------------------------------------------------------------------------
 const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
@@ -581,9 +581,10 @@ async function sendCharacterState(force) {
   if (!force && now - lastSentMs < 50) return;
   lastSentMs = now; lastPacketMs = now;
   const res = await api("/api/multiplayer/character-state", { method: "PATCH", body: JSON.stringify({
-    updates: [{ clientId, position: [me.x, me.y],
-      animationState: me.anim, animation_state: me.anim, anim: me.anim, health: me.health, score: me.score,
-      metadata: { name: me.name, color: me.color, yaw: me.yaw, anim: me.anim, animationState: me.anim } }],
+    updates: [{ clientId, characterModelId: "character-basic", position: [me.x, me.y], pos: [me.x, me.y],
+      velocity: [me.vx, me.vy], animationState: me.anim, animationFrame: 0, isJumping: false,
+      facing: me.yaw, score: me.score, health: me.health, onGround: true, timestamp: Date.now(),
+      metadata: { health: me.health, name: me.name, color: me.color, yaw: me.yaw } }],
     timestamp: Date.now(),
   })});
   if (res.status === 403) { const d = await res.json().catch(() => ({})); log("character-state rejected: " + JSON.stringify(d)); await leave(); }
@@ -621,16 +622,14 @@ function applyMp(mp) {
       if (!c || !c.clientId || c.clientId === clientId) continue;
       const meta = c.metadata || {};
       const pos = normalizePos(c.position || c.pos);
-      const yaw = typeof meta.yaw === "number" ? meta.yaw
-        : typeof c.facing === "number" ? c.facing * Math.PI / 2 : 0;
-      const rawAnim = c.animationState ?? c.animation_state ?? c.anim ?? c.animation ?? meta.animationState ?? meta.anim ?? meta.animationState ?? "stand";
+      const yaw = typeof c.facing === "number" ? c.facing : (typeof meta.yaw === "number" ? meta.yaw : (typeof c.rotation === "number" ? c.rotation : 0));
       const p = upsertRemote(c.clientId, {
         name: meta.name || c.characterModelId || "player",
         color: meta.color || colorFor(c.clientId),
         health: c.health ?? meta.health ?? 100,
         score: c.score ?? 0,
         yaw,
-        anim: rawAnim,
+        anim: c.animationState || "stand",
       });
       p.x2d = pos.x2d; p.y2d = pos.y2d;
       const t = to3D(pos.x2d, pos.y2d);
