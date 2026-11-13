@@ -343,7 +343,9 @@ function firstMeshOf(root) {
   return meshes[0] || root;
 }
 function makeClone(parent, suffix) {
-  const inst = modelContainer.instantiateModelsToScene((name) => name + suffix);
+  // doNotInstantiate:true = real CLONE, not an instance. Default is instance,
+  // and skinned GLB instances are invisible. This is why no player showed.
+  const inst = modelContainer.instantiateModelsToScene((name) => name + suffix, false, { doNotInstantiate: true });
   const root = inst.rootNodes[0];
   try { root.setEnabled(true); } catch (e) {}
   try { for (const m of root.getChildMeshes(false)) m.setEnabled(true); } catch (e) {}
