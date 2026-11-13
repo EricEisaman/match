@@ -12,9 +12,9 @@
   WHAT IT IS
   - Babylon.js 3D version of top-down.html. Same MATCH protocol, same API:
     join -> stream (SSE) -> character-state / item-state / heartbeat -> leave.
-  - Local hero is the Playground HVGirl.glb (WASD tank controls, Walking /
-    WalkingBack / Idle / Samba). Remote players are low-poly capsule avatars
-    so we never have to clone a skinned GLB + skeleton per player.
+  - Local hero is character-basic.glb (WASD tank controls, idle / walk / run).
+    idle / walk / run). Every player is a clone of the SAME character-basic.glb
+    from one hidden basis. No primitives.
   - Name bar + health bar: Babylon.GUI panels linked to each character mesh
     (see createCharacterUI). Health is demo-only relayed state: the server
     broadcasts it, it does not simulate combat. Use -10 HP / Heal to see
@@ -60,7 +60,7 @@
 <p class="panel">
   3D version of the top-down demo. Move with <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> or arrow keys
   (tank controls: <kbd>W</kbd>/<kbd>S</kbd> forward/back, <kbd>A</kbd>/<kbd>D</kbd> turn),
-  <kbd>B</kbd> for Samba, orbit with the mouse. Walk over a <code>gem</code> to collect it.
+  Orbit with the mouse. Walk over a <code>gem</code> to collect it.
   Gems are <code>item-state</code> — <code>updates</code> spawn them, <code>collections</code> collect them.
   Every player gets a floating <b>name bar + health bar</b> above their head.
   No timers anywhere: movement is <code>keydown</code>/<code>keyup</code> + render loop,
@@ -76,7 +76,6 @@
   <button id="heartbeatBtn" disabled>Heartbeat</button>
 </div>
 <div>
-  <button id="sambaBtn" disabled title="Hold B also works">💃 Samba (B)</button>
   <button id="damageBtn" disabled title="Demo only — broadcasts lower health">−10 HP</button>
   <button id="healBtn" disabled title="Demo only — broadcasts higher health">+10 HP</button>
   <button id="resetHpBtn" disabled>Reset HP</button>
@@ -125,7 +124,7 @@ let lastSentMs = 0, lastPacketMs = 0;
 let joined = false;
 
 const me = { x: WORLD_2D / 2, y: WORLD_2D / 2, vx: 0, vy: 0, health: 100, score: 0, name: "player", color: "#4da3ff", yaw: 0, anim: "stand" };
-const players = new Map(); // clientId -> {x2d,y2d,health,score,name,color,yaw,anim,root,capsule,ui}
+const players = new Map(); // clientId -> {x2d,y2d,health,score,name,color,yaw,anim,root,clone,mesh,ui}
 const gems = new Map();    // instanceId -> {x2d,y2d,mesh}
 const pendingCollections = new Set();
 
@@ -158,7 +157,7 @@ function normalizePos(pos) {
 }
 
 // ---------------------------------------------------------------------------
-// Babylon scene — adapted from the Playground (HVGirl + ArcRotateCamera)
+// Babylon scene — adapted from the Playground (character-basic + ArcRotateCamera)
 // ---------------------------------------------------------------------------
 const canvas = $("renderCanvas");
 const engine = new BABYLON.Engine(canvas, true);
@@ -251,7 +250,7 @@ ground.material = groundMaterial;
 // --- GUI: fullscreen UI + instructions (Playground pattern) ---------------
 const advancedTexture = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("UI");
 const instructions = new BABYLON.GUI.TextBlock();
-instructions.text = "Move w/ WASD keys, B for Samba, look with the mouse";
+instructions.text = "Move w/ WASD keys, look with the mouse";
 instructions.color = "white";
 instructions.fontSize = 16;
 instructions.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
@@ -321,8 +320,7 @@ function createCharacterUI(mesh, characterName, maxHealth, isMe) {
 
 // ---------------------------------------------------------------------------
 // Hero — Playground HVGirl, parented to a TransformNode we actually move.
-// If the GLB fails (offline / blocked), fall back to a capsule so the
-// demo is still playable and the name/health bars still work.
+// Basis first, hidden. Local = clone 0, remotes = successive clones.
 // ---------------------------------------------------------------------------
 const heroRoot = new BABYLON.TransformNode("heroRoot", scene);
 heroRoot.position.set(0, 0, 0);
@@ -342,56 +340,58 @@ function firstMeshOf(root) {
   const meshes = root.getChildMeshes ? root.getChildMeshes(false) : [];
   return meshes[0] || root;
 }
-function makeClone(parent, suffix) {
-  // doNotInstantiate:true = real CLONE, not an instance. Default is instance,
-  // and skinned GLB instances are invisible. This is why no player showed.
-  const inst = modelContainer.instantiateModelsToScene((name) => name + suffix, false, { doNotInstantiate: true });
-  const root = inst.rootNodes[0];
+function makeClone(parent) {
+  const entries = modelContainer.instantiateModelsToScene(undefined, false, { doNotInstantiate: true });
+  const root = entries.rootNodes[0];
   try { root.setEnabled(true); } catch (e) {}
   try { for (const m of root.getChildMeshes(false)) m.setEnabled(true); } catch (e) {}
   root.parent = parent;
-  root.scaling.scaleInPlace(0.1);
   root.position.set(0, 0, 0);
   const mesh = firstMeshOf(root);
   const groups = {};
-  for (const g of inst.animationGroups) groups[g.name] = g;
+  for (const g of entries.animationGroups) {
+    try { g.stop(); } catch (e) {}
+    g.name = g.name.replace("Clone of ", "");
+    groups[g.name.toLowerCase()] = g;
+    groups[g.name] = g;
+  }
   return { root, mesh, animGroups: groups };
 }
-BABYLON.SceneLoader.LoadAssetContainerAsync("", "https://assets.babylonjs.com/meshes/", "HVGirl.glb", scene).then((container) => {
+BABYLON.SceneLoader.LoadAssetContainerAsync("https://dl.dropbox.com/s/ygkvz5mnqfmw238/", "character-basic.glb", scene).then((container) => {
   modelContainer = container;
   modelReady = true;
-  const heroClone = makeClone(heroRoot, "_hero");
+  const heroClone = makeClone(heroRoot);
   heroMesh = heroClone.mesh;
   heroLoaded = true;
   animGroups = heroClone.animGroups;
-  playAnim("Idle");
+  playAnim("idle");
   ensureHeroUI();
-  log("HVGirl loaded: " + Object.keys(animGroups).join(", "));
+  log("character-basic loaded: " + Object.keys(animGroups).join(", "));
   for (const id of [...pendingRemoteIds]) {
     const pp = players.get(id);
     if (pp) attachCloneToRemote(pp);
   }
   pendingRemoteIds.clear();
 }).catch((e) => {
-  log("HVGirl failed to load: " + (e && e.message ? e.message : e));
+  log("character-basic failed to load: " + (e && e.message ? e.message : e));
 });
 
 function playAnim(name) {
-  if (currentAnim === name) return;
-  const g = animGroups[name];
-  if (!g) { currentAnim = name; return; }
-  for (const k of Object.keys(animGroups)) { if (k !== name) animGroups[k].stop(); }
+  const key = String(name).toLowerCase();
+  if (currentAnim === key) return;
+  const g = animGroups[key] || animGroups[name];
+  if (!g) { currentAnim = key; return; }
+  for (const k of Object.keys(animGroups)) { if (k.toLowerCase() !== key) { try { animGroups[k].stop(); } catch (e) {} } }
   g.start(true, 1.0, g.from, g.to, false);
-  currentAnim = name;
+  currentAnim = key;
 }
 function animForInput() {
-  if (keys.has("b")) return "Samba";
-  if (keys.has("s") || keys.has("arrowdown")) return "WalkingBack";
-  if (keys.has("w") || keys.has("a") || keys.has("d") || keys.has("arrowup") || keys.has("arrowleft") || keys.has("arrowright")) return "Walking";
-  return "Idle";
+  if (keys.has("s") || keys.has("arrowdown")) return "walk";
+  if (keys.has("w") || keys.has("a") || keys.has("d") || keys.has("arrowup") || keys.has("arrowleft") || keys.has("arrowright")) return "run";
+  return "idle";
 }
 
-// --- keyboard: Playground ActionManager + window fallback for arrows ------
+// --- keyboard: Playground ActionManager + window key handler for arrows ------
 const inputMap = {};
 scene.actionManager = new BABYLON.ActionManager(scene);
 scene.actionManager.registerAction(new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyDownTrigger, (evt) => {
@@ -406,22 +406,22 @@ addEventListener("keydown", (e) => {
 });
 addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 
-// --- remote players: clones of the SAME HVGirl.glb -------------------------
+// --- remote players: clones of the SAME character-basic.glb ----------------
 function animNameForRemote(anim) {
-  return anim === "run" ? "Walking" : anim === "walkBack" ? "WalkingBack" : anim === "samba" ? "Samba" : "Idle";
+  return anim === "run" ? "run" : anim === "walkBack" ? "walk" : anim === "walk" ? "walk" : "idle";
 }
 function playRemoteAnim(p, anim) {
-  const target = animNameForRemote(anim);
+  const target = animNameForRemote(anim).toLowerCase();
   if (p.animName === target) return;
   p.animName = target;
-  const g = p.animGroups ? p.animGroups[target] : null;
+  const g = p.animGroups ? (p.animGroups[target] || p.animGroups[anim]) : null;
   if (!g) return;
-  for (const k of Object.keys(p.animGroups || {})) { if (k !== target) p.animGroups[k].stop(); }
+  for (const k of Object.keys(p.animGroups || {})) { if (k.toLowerCase() !== target) { try { p.animGroups[k].stop(); } catch (e) {} } }
   g.start(true, 1.0, g.from, g.to, false);
 }
 function attachCloneToRemote(p) {
   if (p.cloneAttached || !modelReady) return;
-  const c = makeClone(p.root, "_" + p.id);
+  const c = makeClone(p.root);
   p.clone = c.root;
   p.mesh = c.mesh;
   p.animGroups = c.animGroups;
@@ -519,7 +519,7 @@ async function join() {
   $("hudDisconnect").textContent = `Game data deleted if empty 5 min (on next packet) · Drop if silent: ${data.disconnection_time_sec ?? disconnectSec}s`;
   $("joinBtn").disabled = true; $("leaveBtn").disabled = false;
   $("spawnBtn").disabled = true;
-  $("heartbeatBtn").disabled = false; $("sambaBtn").disabled = false;
+  $("heartbeatBtn").disabled = false;
   $("damageBtn").disabled = false; $("healBtn").disabled = false; $("resetHpBtn").disabled = false;
   $("hudSync").textContent = `Synchronizer: ${isSynchronizer ? "you" : "other"}`;
   log("joined: " + JSON.stringify(data));
@@ -536,7 +536,7 @@ async function leave() {
   $("status").textContent = "Left."; $("hudSync").textContent = "Synchronizer: —";
   $("joinBtn").disabled = false; $("leaveBtn").disabled = true;
   $("spawnBtn").disabled = true; $("heartbeatBtn").disabled = true;
-  $("sambaBtn").disabled = true; $("damageBtn").disabled = true; $("healBtn").disabled = true; $("resetHpBtn").disabled = true;
+  $("damageBtn").disabled = true; $("healBtn").disabled = true; $("resetHpBtn").disabled = true;
   updateHud();
 }
 async function collectGem(instanceId) {
@@ -694,9 +694,9 @@ scene.onBeforeRenderObservable.add(() => {
   const v2 = { x: (dx3 / Math.max(dt, 1e-4)) / WORLD_3D * WORLD_2D, y: (dz3 / Math.max(dt, 1e-4)) / WORLD_3D * WORLD_2D };
   me.vx = v2.x; me.vy = v2.y;
 
-  // Animation — Playground logic: Samba > WalkBack > Walk > Idle.
+  // Animation: WalkBack > Run > Idle.
   const nextAnim = animForInput();
-  me.anim = nextAnim === "Walking" ? "run" : nextAnim === "WalkingBack" ? "walkBack" : nextAnim === "Samba" ? "samba" : "stand";
+  me.anim = nextAnim === "run" ? "run" : nextAnim === "walk" ? "walkBack" : "stand";
   playAnim(nextAnim);
 
   // Camera follows hero (Playground: camera.target = hero).
@@ -710,7 +710,7 @@ scene.onBeforeRenderObservable.add(() => {
   }
   // Gems spin + bob.
   for (const g of gems.values()) { g.mesh.rotation.y += dt * 1.5; g.mesh.position.y = GEM_Y + Math.sin(now / 300 + g.x2d) * 0.15; }
-  // Remote bob when moving (root bob, GLB has no capsule).
+  // Remote bob when moving (root bob).
   for (const p of players.values()) {
     p.root.position.y = (p.anim === "run" || p.anim === "walkBack") ? Math.abs(Math.sin(now / 120)) * 0.08 : 0;
   }
@@ -728,11 +728,6 @@ $("joinBtn").onclick = join;
 $("leaveBtn").onclick = leave;
 $("spawnBtn").onclick = () => log("spawnGems ignored — server owns gems (24 live, respawn on collect).");
 $("heartbeatBtn").onclick = sendHeartbeat;
-$("sambaBtn").onclick = () => {
-  keys.add("b");
-  setTimeout(() => keys.delete("b"), 1500);
-  sendCharacterState(true);
-};
 $("damageBtn").onclick = () => setHealth(me.health - 10);
 $("healBtn").onclick = () => setHealth(me.health + 10);
 $("resetHpBtn").onclick = () => setHealth(100);
