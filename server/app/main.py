@@ -34,7 +34,7 @@ from .multiplayer.dirty import DirtyFilter, FreshnessMatrix
 from datastar_py.fastapi import DatastarResponse
 from datastar_py import ServerSentEventGenerator as SSE
 
-from demos import needs_server_gems, gem_target, is_turn_based
+from .demos import needs_server_gems, gem_target, is_turn_based
 
 
 def _now_ms() -> int:
