@@ -113,8 +113,8 @@ const V3 = BABYLON.Vector3, C3 = BABYLON.Color3, clamp = BABYLON.Scalar.Clamp;
 // ---------- Multiplayer: own game id, NOT bjs-jets ----------
 const GAME_ID = "viper-demo";
 const ENV_NAME = "viper-demo";
-const LOCK_RANGE_M = 200;
-const LOCK_BREAK_M = 260;
+const LOCK_RANGE_M = 1000;
+const LOCK_BREAK_M = 1200;
 const CHARACTER_SCHEMA = {
   version: 1,
   fields: {
@@ -450,7 +450,7 @@ function tryLock(){
     sendCharacterState(true);
   } else {
     me.lock_target="";
-    showToast("NO LOCK - NO TARGET VISIBLE WITHIN 200 M", 1800);
+    showToast("NO LOCK - NO TARGET VISIBLE WITHIN 1000 M", 1800);
     sendCharacterState(true);
   }
 }
