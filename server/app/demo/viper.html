@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>VIPER - Multiplayer Sidewinders</title>
+<!--
+  VIPER: an enhancement of bjs-jets.html.
+  Same join / character-state / SSE pattern, same 2000x2000 world,
+  same ocean / radar / fullscreen. New: radar lock (L), Sidewinder
+  missiles (SPACE), explosions, under-lock warning, missile radar dots,
+  and a destroyed end screen.
+
+  Requires sidewinder.js in the same folder as this file.
+  See demos.py: viper-demo lists sidewinder.js in extra_files.
+-->
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#0a1420;color:#e9f7ff;font:14px/1.5 system-ui,monospace;overflow:hidden}
+  #topbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;background:#0f1f30;border-bottom:1px solid #22344a;position:relative;z-index:20}
+  #topbar h1{font-size:16px;margin:0 8px 0 0;letter-spacing:.04em}
+  #topbar input{padding:7px 9px;border-radius:6px;border:1px solid #2b425c;background:#0a1624;color:#e9f7ff;outline:none}
+  #topbar input[type=number]{width:82px}
+  #topbar button{padding:8px 12px;border-radius:6px;border:1px solid #2b425c;background:#16324a;color:#e9f7ff;cursor:pointer}
+  #topbar button:disabled{opacity:.45;cursor:default}
+  #topbar button.primary{background:#ff713d;border-color:#ff713d;color:#fff;font-weight:700}
+  #status{margin-left:auto;font-size:12px;opacity:.85}
+  #wrap{position:relative;height:calc(100% - 53px)}
+  #renderCanvas{width:100%;height:100%;display:block;touch-action:none;outline:none}
+  #hud{position:absolute;left:16px;top:16px;color:#e9f7ff;background:rgba(8,20,35,.65);padding:12px 16px;border-radius:8px;font:13px/1.6 monospace;pointer-events:none;z-index:10;white-space:pre}
+  #radarWrap{position:absolute;right:16px;top:16px;z-index:10;display:flex;flex-direction:column;align-items:center;gap:6px;pointer-events:none}
+  #radar{width:180px;height:180px;border-radius:50%;background:radial-gradient(circle at 50% 50%, rgba(10,30,45,.92) 0%, rgba(8,20,35,.92) 62%, rgba(4,12,20,.95) 100%);border:2px solid rgba(120,220,255,.55);box-shadow:0 0 0 1px rgba(0,0,0,.35), 0 10px 30px rgba(0,0,0,.35);position:relative;overflow:hidden}
+  #radar canvas{width:100%;height:100%;display:block;border-radius:50%}
+  #radarLabel{font:11px/1.2 monospace;letter-spacing:.18em;color:#9fd8ff;text-align:center}
+  #radarLegend{font:11px/1.5 monospace;color:#cfeaff;background:rgba(8,20,35,.65);padding:6px 8px;border-radius:6px;max-width:190px;white-space:pre}
+  #log{position:absolute;left:16px;bottom:16px;z-index:10;background:rgba(8,20,35,.72);padding:8px 10px;border-radius:6px;font:11px/1.5 monospace;max-width:420px;max-height:120px;overflow:auto;white-space:pre-wrap}
+  #fsBtn{position:absolute;right:16px;bottom:16px;z-index:20;padding:10px 14px;border-radius:8px;border:1px solid #2b425c;background:rgba(8,20,35,.85);color:#e9f7ff;cursor:pointer;font:13px monospace}
+  #fsBtn:hover{background:#16324a}
+  #lockWarning{position:absolute;inset:0;pointer-events:none;z-index:15;border:6px solid rgba(255,30,30,.95);box-shadow:inset 0 0 60px rgba(255,30,30,.55);opacity:0;transition:opacity .18s}
+  #lockWarning.active{opacity:1;animation:lockPulse 0.8s infinite}
+  #lockWarning .warn{position:absolute;top:14px;left:50%;transform:translateX(-50%);background:rgba(180,0,0,.92);color:#fff;padding:6px 14px;border-radius:999px;font:700 13px monospace;letter-spacing:.12em;white-space:nowrap}
+  @keyframes lockPulse{0%,100%{box-shadow:inset 0 0 40px rgba(255,30,30,.45)}50%{box-shadow:inset 0 0 90px rgba(255,30,30,.8)}}
+  #toast{position:absolute;top:18px;left:50%;transform:translateX(-50%);z-index:25;background:rgba(8,20,35,.88);border:1px solid #2b425c;color:#e9f7ff;padding:9px 16px;border-radius:999px;font:700 13px monospace;letter-spacing:.06em;pointer-events:none;opacity:0;transition:opacity .15s;max-width:92%;text-align:center}
+  #toast.show{opacity:1}
+  #toast.lock{border-color:#ff4444;color:#ffd7d7}
+  #toast.empty{border-color:#ffaa00;color:#ffe1a8}
+  #toast.splash{border-color:#ffd23d;color:#fff3b0}
+  #missileBar{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:12;background:rgba(8,20,35,.72);padding:7px 12px;border-radius:999px;font:12px monospace;pointer-events:none;white-space:nowrap}
+  #missileBar .pip{font-size:16px;letter-spacing:2px}
+  #missileBar .pip.empty{color:#ffaa00}
+  #missileBar.flash{animation:missileFlash .5s 3}
+  @keyframes missileFlash{0%,100%{box-shadow:0 0 0 rgba(255,170,0,0)}50%{box-shadow:0 0 0 3px rgba(255,170,0,.7)}}
+  #endScreen{position:absolute;inset:0;z-index:40;background:radial-gradient(circle at 50% 35%, rgba(60,0,0,.92), rgba(5,0,0,.97));display:none;align-items:center;justify-content:center;flex-direction:column;gap:10px;text-align:center;padding:24px}
+  #endScreen.show{display:flex}
+  #endScreen h2{font-size:44px;margin:0;letter-spacing:.12em;color:#ff4444}
+  #endScreen p{margin:0;color:#ffd7d7;font-size:15px}
+  #endScreen .sub{color:#cfeaff;opacity:.85;font-size:13px}
+  #endScreen button{margin-top:12px;padding:12px 22px;border-radius:8px;border:1px solid #ff4444;background:#b00000;color:#fff;cursor:pointer;font:700 14px monospace}
+  #endScreen button.secondary{background:transparent;color:#e9f7ff;border-color:#2b425c}
+  #spectateBar{position:absolute;top:58px;left:50%;transform:translateX(-50%);z-index:25;background:rgba(8,20,35,.88);border:1px solid #2b425c;padding:8px 12px;border-radius:999px;font:12px monospace;display:none;gap:8px;align-items:center}
+  #spectateBar.show{display:flex}
+  #spectateBar button{padding:6px 12px;border-radius:6px;border:1px solid #ff713d;background:#ff713d;color:#fff;cursor:pointer;font:700 12px monospace}
+</style>
+</head>
+<body>
+<div id="topbar">
+  <h1>VIPER</h1>
+  <label>Name <input id="name" value="Dale"/></label>
+  <label>Skill <input id="skill" type="number" value="1000"/></label>
+  <label>Timeout <input id="disconnectSec" type="number" value="60"/></label>
+  <button id="joinBtn" class="primary">Join</button>
+  <button id="leaveBtn" disabled>Leave</button>
+  <button id="resetBtn">Reset (R)</button>
+  <button id="fsTopBtn">Fullscreen</button>
+  <span id="status">Not joined.</span>
+</div>
+<div id="wrap">
+  <canvas id="renderCanvas"></canvas>
+  <div id="hud">VIPER FLIGHT</div>
+  <div id="radarWrap">
+    <div id="radar"><canvas id="radarCanvas" width="360" height="360"></canvas></div>
+    <div id="radarLabel">RADAR - HEADING-UP</div>
+    <div id="radarLegend">You - white</div>
+  </div>
+  <div id="log"></div>
+  <div id="lockWarning"><div class="warn">LOCKED - BREAK LINE OF SIGHT</div></div>
+  <div id="toast"></div>
+  <div id="missileBar"><span class="pip" id="missilePips">----</span> <span id="missileText">SIDEWINDERS 4 / 4</span></div>
+  <div id="spectateBar"><span>SPECTATING</span><button id="respawnBtn2">Respawn - Rearm 4</button></div>
+  <div id="endScreen">
+    <h2>JET DESTROYED</h2>
+    <p id="endKiller">Shot down.</p>
+    <p class="sub" id="endStats"></p>
+    <div><button id="respawnBtn">Respawn - New Jet, Rearm 4</button> <button id="spectateBtn" class="secondary">Stay Spectating</button></div>
+    <p class="sub">Sidewinders never replenish in a life. Respawn is a new jet, so it rearms.</p>
+  </div>
+  <button id="fsBtn">Fullscreen</button>
+</div>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script type="module">
+import { Sidewinder, MOUNT_OFFSETS, SIDEWINDER_CONFIG, parseMissilesString } from "./sidewinder.js";
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true);
+const scene = new BABYLON.Scene(engine);
+scene.clearColor = new BABYLON.Color4(0.48, 0.73, 0.94, 1);
+scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
+scene.fogDensity = 0.0015;
+scene.fogColor = new BABYLON.Color3(0.48, 0.73, 0.94);
+const V3 = BABYLON.Vector3, C3 = BABYLON.Color3, clamp = BABYLON.Scalar.Clamp;
+
+// ---------- Multiplayer: own game id, NOT bjs-jets ----------
+const GAME_ID = "viper-demo";
+const ENV_NAME = "viper-demo";
+const LOCK_RANGE_M = 200;
+const LOCK_BREAK_M = 260;
+const CHARACTER_SCHEMA = {
+  version: 1,
+  fields: {
+    position: { type: "vec2", required: true, authority: "client", semantic: "position" },
+    health: { type: "int", required: true, min: 0, max: 100, authority: "client", semantic: "health" },
+    score: { type: "int", authority: "server", default: 0, min: 0, semantic: "score" },
+    name: { type: "string", authority: "client", semantic: "name" },
+    color: { type: "string", authority: "client" },
+    yaw: { type: "number", authority: "client" },
+    pitch: { type: "number", authority: "client" },
+    bank: { type: "number", authority: "client" },
+    altitude: { type: "number", authority: "client" },
+    speed: { type: "number", authority: "client" },
+    anim: { type: "string", authority: "client" },
+    velocity: { type: "vec2", authority: "client" },
+    alive: { type: "bool", authority: "client", default: true },
+    missiles_remaining: { type: "int", authority: "client", default: 4, min: 0, max: 4 },
+    lock_target: { type: "string", authority: "client", default: "", max: 64 },
+    missiles: { type: "string", authority: "client", default: "[]", max: 8000 },
+    destroyed_by: { type: "string", authority: "client", default: "", max: 64 }
+  }
+};
+let effectiveSchema = CHARACTER_SCHEMA;
+const WORLD_2D = 2000;
+const JET_RANGE = 2400;
+function to3D(x2d, y2d){ return { x:(x2d/WORLD_2D-0.5)*JET_RANGE, z:(y2d/WORLD_2D-0.5)*JET_RANGE }; }
+function to2D(x3d, z3d){ return { x:(x3d/JET_RANGE+0.5)*WORLD_2D, y:(z3d/JET_RANGE+0.5)*WORLD_2D }; }
+function normalizePos(pos){
+  if(!Array.isArray(pos)||pos.length<2) return {x2d:WORLD_2D/2, y2d:WORLD_2D/2};
+  return {x2d:pos[0], y2d:pos[1]};
+}
+function colorFor(id){
+  let h=0; for(const c of String(id)) h=(h*31+c.charCodeAt(0))>>>0;
+  const hue=(h%360)/360;
+  const f=(n)=>{const k=(((n+hue)%1)+1)%1; if(k<1/6) return 0.55+0.45*6*k; if(k<1/2) return 1.0; if(k<2/3) return 0.55+0.45*(2/3-k)*6; return 0.55;};
+  const r=Math.round(255*f(1/3)), g=Math.round(255*f(0)), b=Math.round(255*f(-1/3));
+  return "#"+[r,g,b].map(v=>v.toString(16).padStart(2,"0")).join("");
+}
+let clientId="", sessionId="", roomId="", joined=false, isSynchronizer=false;
+let stream=null, lastPacketMs=0, lastSentMs=0, lastSentAnim=null;
+let spectating=false, splashCount=0, shakeMag=0;
+const me={x:WORLD_2D/2, y:WORLD_2D/2, vx:0, vy:0, health:100, score:0, name:"player", color:"#4da3ff", yaw:0, pitch:0, bank:0, altitude:90, speed:95, anim:"cruise", alive:true, missiles_remaining:4, lock_target:"", destroyed_by:""};
+const players=new Map();
+function log(s){ const el=$("log"); el.textContent=(s+"\n"+el.textContent).slice(0,3000); }
+async function api(path, opts={}){ return fetch(path,{...opts, headers:{"Content-Type":"application/json","X-Client-ID":clientId,...(opts.headers||{})}}); }
+
+// ---------- Toast: timed in the render loop, no timers ----------
+let toastUntil=0;
+function showToast(text, ms, kind){
+  const el=$("toast");
+  el.textContent=text;
+  el.className=kind ? "show "+kind : "show";
+  toastUntil=performance.now()+(ms||2200);
+}
+function showNoMissiles(){
+  showToast("NO SIDEWINDERS REMAIN - REARM ON RESPAWN ONLY", 1800, "empty");
+  const bar=$("missileBar");
+  bar.classList.remove("flash"); void bar.offsetWidth; bar.classList.add("flash");
+}
+
+// ---------- Scene ----------
+const light=new BABYLON.HemisphericLight("skyLight", new V3(0,1,0), scene);
+light.intensity=1.15; light.groundColor=new C3(0.22,0.3,0.4);
+const sun=new BABYLON.DirectionalLight("sun", new V3(-0.5,-1,0.4), scene); sun.intensity=1.6;
+function material(name,color,emissive){
+  const m=new BABYLON.StandardMaterial(name, scene);
+  m.diffuseColor=C3.FromHexString(color); m.specularColor=new C3(0.5,0.5,0.5);
+  if(emissive) m.emissiveColor=C3.FromHexString(emissive);
+  return m;
+}
+function buildJet(accentHex, ownerId){
+  const jet=new BABYLON.TransformNode("jet_"+Math.random().toString(36).slice(2,7), scene);
+  const metal=material("silver_"+jet.name,"#b8c6d6"); metal.backFaceCulling=false;
+  const dark=material("dark_"+jet.name,"#243247"); dark.backFaceCulling=false;
+  const trim=material("trim_"+jet.name, accentHex); trim.backFaceCulling=false;
+  const glass=material("canopy_"+jet.name,"#173d66","#0b2036"); glass.specularPower=100;
+  function part(mesh, mat, pos){ mesh.parent=jet; mesh.material=mat; mesh.position.copyFrom(pos); return mesh; }
+  const body=part(BABYLON.MeshBuilder.CreateCylinder("fuselage",{height:7,diameterTop:0.9,diameterBottom:1.15,tessellation:32},scene),metal,new V3(0,0,0));
+  body.rotation.x=Math.PI/2;
+  const nose=part(BABYLON.MeshBuilder.CreateCylinder("nose",{height:2.8,diameterTop:0,diameterBottom:0.9,tessellation:32},scene),metal,new V3(0,0,4.9));
+  nose.rotation.x=Math.PI/2;
+  const canopy=part(BABYLON.MeshBuilder.CreateSphere("cockpit",{diameter:1,segments:24},scene),glass,new V3(0,0.48,1.7));
+  canopy.scaling.set(0.8,0.7,2.3);
+  function wing(name, points, mat){
+    const mesh=new BABYLON.Mesh(name, scene); const data=new BABYLON.VertexData();
+    data.positions=points.flat(); data.indices=[0,1,2,0,2,3]; data.normals=[];
+    BABYLON.VertexData.ComputeNormals(data.positions,data.indices,data.normals);
+    data.applyToMesh(mesh); mesh.parent=jet; mesh.material=mat; return mesh;
+  }
+  for(const side of [-1,1]){
+    wing("mainWing",[[side*0.45,-0.05,1.7],[side*5.1,-0.12,-2.3],[side*4.9,-0.12,-3.0],[side*0.45,-0.05,-1.6]],metal);
+    wing("tailWing",[[side*0.35,0.15,-2.0],[side*2.3,0.15,-3.8],[side*2.1,0.15,-4.2],[side*0.35,0.15,-3.3]],trim);
+  }
+  wing("verticalTail",[[0,0.35,-1.7],[0,2.2,-3.1],[0,2.2,-3.8],[0,0.35,-3.6]],dark);
+  const nozzle=part(BABYLON.MeshBuilder.CreateCylinder("nozzle",{height:0.7,diameterTop:0.85,diameterBottom:1,tessellation:24},scene),dark,new V3(0,0,-3.6));
+  nozzle.rotation.x=Math.PI/2;
+  const fireMat=material("exhaust_"+jet.name,"#ff9b35","#ff6515"); fireMat.disableLighting=true;
+  const flame=part(BABYLON.MeshBuilder.CreateSphere("flame",{diameter:1,segments:16},scene),fireMat,new V3(0,0,-4.7));
+  flame.scaling.set(0.6,0.6,2.2);
+  const missiles=MOUNT_OFFSETS.map((offset, slot)=>new Sidewinder({scene, slot, ownerId:ownerId||"", ownerColor:accentHex, mountOffset:offset, parentJet:jet}));
+  return {jet, flame, missiles};
+}
+const localJet=buildJet("#ff713d","local");
+const jet=localJet.jet, flame=localJet.flame;
+const localMissiles=localJet.missiles;
+const glow=new BABYLON.GlowLayer("engineGlow", scene); glow.intensity=0.75; glow.addIncludedOnlyMesh(flame);
+
+const oceanMat=material("ocean","#247d9c"); oceanMat.specularColor=new C3(0.6,0.75,0.8);
+const waterTexture=new BABYLON.DynamicTexture("waterGrid",{width:512,height:512},scene,false);
+const wctx=waterTexture.getContext();
+wctx.fillStyle="#247d9c"; wctx.fillRect(0,0,512,512);
+wctx.strokeStyle="#388da8"; wctx.lineWidth=2;
+for(let i=0;i<=512;i+=64){ wctx.beginPath(); wctx.moveTo(i,0); wctx.lineTo(i,512); wctx.stroke(); wctx.beginPath(); wctx.moveTo(0,i); wctx.lineTo(512,i); wctx.stroke(); }
+waterTexture.update(); waterTexture.uScale=80; waterTexture.vScale=80; oceanMat.diffuseTexture=waterTexture;
+const ocean=BABYLON.MeshBuilder.CreateGround("ocean",{width:12000,height:12000},scene); ocean.material=oceanMat;
+const cloudMat=material("cloud","#ffffff","#424b55"); cloudMat.specularColor=C3.Black();
+const clouds=[];
+for(let i=0;i<35;i++){
+  const c=BABYLON.MeshBuilder.CreateSphere("cloud",{diameter:1,segments:8},scene);
+  c.material=cloudMat; c.scaling.set(35+Math.random()*70,8+Math.random()*12,20+Math.random()*35);
+  c.position.set((Math.random()-0.5)*2400,170+Math.random()*230,(Math.random()-0.5)*2400); clouds.push(c);
+}
+const camera=new BABYLON.FreeCamera("chaseCamera", new V3(0,90,-35), scene);
+camera.minZ=0.2; camera.maxZ=15000; camera.fov=0.9; camera.inputs.clear();
+
+// ---------- Lock reticle: follows the locked jet ----------
+const lockReticle=new BABYLON.TransformNode("lockReticle", scene);
+const lockRing=BABYLON.MeshBuilder.CreateTorus("lockRing",{diameter:11,thickness:0.28,tessellation:32},scene);
+const lockRingMat=new BABYLON.StandardMaterial("lockRingMat", scene);
+lockRingMat.emissiveColor=new C3(1,0.15,0.15); lockRingMat.disableLighting=true;
+lockRing.material=lockRingMat; lockRing.parent=lockReticle;
+const lockCorners=[];
+for(let i=0;i<4;i++){
+  const corner=BABYLON.MeshBuilder.CreateBox("lockCorner",{width:1.6,height:0.3,depth:0.3},scene);
+  corner.material=lockRingMat; corner.parent=lockReticle;
+  const a=(i/4)*Math.PI*2+Math.PI/4;
+  corner.position.set(Math.cos(a)*6.5, Math.sin(a)*6.5, 0);
+  corner.rotation.z=a;
+  lockCorners.push(corner);
+}
+lockReticle.setEnabled(false);
+
+// ---------- Explosions ----------
+const activeExplosions=[];
+const explodedKeys=new Set();
+function createExplosion(pos, scale){
+  const s=scale||1;
+  const group=new BABYLON.TransformNode("expl_"+Math.random().toString(36).slice(2,6), scene);
+  group.position.copyFrom(pos);
+  const coreMat=new BABYLON.StandardMaterial("expCore_"+group.name, scene);
+  coreMat.emissiveColor=new C3(1,0.95,0.7); coreMat.disableLighting=true;
+  const core=BABYLON.MeshBuilder.CreateSphere("expCore",{diameter:3*s,segments:16},scene);
+  core.material=coreMat; core.parent=group;
+  const outerMat=new BABYLON.StandardMaterial("expOuter_"+group.name, scene);
+  outerMat.emissiveColor=new C3(1,0.45,0.05); outerMat.disableLighting=true; outerMat.alpha=0.85;
+  const outer=BABYLON.MeshBuilder.CreateSphere("expOuter",{diameter:6*s,segments:16},scene);
+  outer.material=outerMat; outer.parent=group;
+  const ringMat=new BABYLON.StandardMaterial("expRing_"+group.name, scene);
+  ringMat.emissiveColor=new C3(1,0.7,0.2); ringMat.disableLighting=true; ringMat.alpha=0.9;
+  const ring=BABYLON.MeshBuilder.CreateTorus("expRing",{diameter:4*s,thickness:0.5*s,tessellation:32},scene);
+  ring.material=ringMat; ring.parent=group; ring.rotation.x=Math.PI/2;
+  const light=new BABYLON.PointLight("expLight_"+group.name, pos.clone(), scene);
+  light.diffuse=new C3(1,0.6,0.2); light.intensity=400; light.range=260;
+  const smokeMat=new BABYLON.StandardMaterial("expSmoke_"+group.name, scene);
+  smokeMat.diffuseColor=new C3(0.25,0.25,0.25); smokeMat.alpha=0.6;
+  const sparks=[];
+  for(let i=0;i<90;i++){
+    const m=new BABYLON.StandardMaterial("spark_"+group.name+"_"+i, scene);
+    const warm=Math.random()<0.6;
+    m.emissiveColor=warm?new C3(1,0.65,0.15):new C3(1,0.95,0.6); m.disableLighting=true;
+    const sp=BABYLON.MeshBuilder.CreateSphere("spark",{diameter:(0.35+Math.random()*0.5)*s,segments:8},scene);
+    sp.material=m; sp.parent=group; sp.position.set(0,0,0);
+    const dir=new V3(Math.random()*2-1, Math.random()*2-1, Math.random()*2-1); dir.normalize();
+    sparks.push({mesh:sp, mat:m, vel:dir.scale(25+Math.random()*65), life:0.7+Math.random()*0.9});
+  }
+  const smoke=[];
+  for(let i=0;i<14;i++){
+    const sp=BABYLON.MeshBuilder.CreateSphere("smoke",{diameter:(2+Math.random()*3)*s,segments:10},scene);
+    sp.material=smokeMat; sp.parent=group;
+    sp.position.set((Math.random()-0.5)*4, (Math.random()-0.5)*4, (Math.random()-0.5)*4);
+    smoke.push({mesh:sp, vel:new V3((Math.random()-0.5)*6, 4+Math.random()*6, (Math.random()-0.5)*6)});
+  }
+  activeExplosions.push({group, core, outer, ring, light, sparks, smoke, age:0, scale:s, coreMat, outerMat, ringMat, smokeMat});
+  const distToMe=V3.Distance(pos, jet.position);
+  if(distToMe<220) shakeMag=Math.min(14, 14*(1-distToMe/220)+4);
+}
+function updateExplosions(dt){
+  for(let i=activeExplosions.length-1;i>=0;i--){
+    const e=activeExplosions[i];
+    e.age+=dt;
+    const t=e.age;
+    const coreScale=1+t*9;
+    e.core.scaling.set(coreScale,coreScale,coreScale);
+    e.coreMat.alpha=Math.max(0,1-t/0.5);
+    const outerScale=1+t*6;
+    e.outer.scaling.set(outerScale,outerScale,outerScale);
+    e.outerMat.alpha=Math.max(0,0.85-t/1.1);
+    const ringScale=1+t*11;
+    e.ring.scaling.set(ringScale,ringScale,ringScale);
+    e.ringMat.alpha=Math.max(0,0.9-t/0.9);
+    e.light.intensity=Math.max(0,400*(1-t/1.4));
+    for(const sp of e.sparks){
+      sp.life-=dt;
+      sp.vel.y-=22*dt;
+      sp.mesh.position.addInPlace(sp.vel.scale(dt));
+      sp.mat.alpha=Math.max(0, Math.min(1, sp.life));
+    }
+    for(const sm of e.smoke){
+      sm.mesh.position.addInPlace(sm.vel.scale(dt));
+      const s=sm.mesh.scaling.x+dt*1.2;
+      sm.mesh.scaling.set(s,s,s);
+    }
+    e.smokeMat.alpha=Math.max(0,0.6-t/1.8);
+    if(t>1.8){
+      try{ e.group.dispose(); }catch(err){}
+      try{ e.light.dispose(); }catch(err){}
+      try{ e.coreMat.dispose(); e.outerMat.dispose(); e.ringMat.dispose(); e.smokeMat.dispose(); }catch(err){}
+      activeExplosions.splice(i,1);
+    }
+  }
+}
+
+// ---------- Controls ----------
+const keys=new Set();
+const controlled=new Set(["KeyW","KeyS","KeyA","KeyD","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","ShiftLeft","ShiftRight","KeyR","KeyL","Space"]);
+canvas.tabIndex=0;
+function onDown(e){
+  if(!controlled.has(e.code)) return;
+  e.preventDefault();
+  if(e.code==="KeyR" && !e.repeat) reset();
+  if(e.code==="KeyL" && !e.repeat) tryLock();
+  if(e.code==="Space" && !e.repeat) tryFire();
+  keys.add(e.code);
+}
+function onUp(e){ keys.delete(e.code); }
+// Single window listener for all keys: canvas keydown bubbles to window,
+// so a second canvas listener would fire L / SPACE twice and double-fire.
+window.addEventListener("keydown", onDown);
+window.addEventListener("keyup", onUp);
+window.addEventListener("blur", ()=>keys.clear());
+canvas.addEventListener("pointerdown", ()=>canvas.focus());
+
+let yaw=0, pitch=0, bank=0, speed=95, time=0;
+function reset(){
+  const p=to3D(me.x, me.y);
+  jet.position.set(p.x, 90, p.z); yaw=pitch=bank=0; speed=95; jet.rotation.set(0,0,0);
+  camera.position.set(p.x, 95, p.z-30); camera.setTarget(jet.position.add(new V3(0,1,12)));
+  me.yaw=0; me.pitch=0; me.bank=0; me.altitude=90; me.speed=95;
+}
+reset();
+function respawn(){
+  spectating=false;
+  $("spectateBar").classList.remove("show");
+  hideEndScreen();
+  me.alive=true; me.health=100; me.destroyed_by=""; me.lock_target="";
+  me.missiles_remaining=4;
+  for(const m of localMissiles) m.mount();
+  jet.setEnabled(true);
+  reset();
+  showToast("REARMED - 4 SIDEWINDERS - GOOD HUNTING", 2200, "splash");
+  sendCharacterState(true);
+}
+function hideEndScreen(){ $("endScreen").classList.remove("show"); }
+function showEndScreen(killer){
+  $("endKiller").textContent=killer ? ("Shot down by "+killer+".") : "Shot down.";
+  $("endStats").textContent="Splashes: "+splashCount+" - Sidewinders left at death: "+me.missiles_remaining+" / 4";
+  $("endScreen").classList.add("show");
+}
+function destroyMe(killerId, killerName){
+  if(!me.alive) return;
+  me.alive=false; me.health=0; me.destroyed_by=killerName||"";
+  me.lock_target="";
+  lockReticle.setEnabled(false);
+  const pos=jet.position.clone();
+  jet.setEnabled(false);
+  createExplosion(pos, 1.6);
+  showEndScreen(killerName||"an opponent");
+  sendCharacterState(true);
+  log("destroyed by "+(killerName||killerId));
+}
+
+// ---------- Fullscreen ----------
+const wrapEl=$("wrap");
+function updateFsLabel(){
+  const on=!!document.fullscreenElement;
+  $("fsBtn").textContent=on?"Exit Fullscreen":"Fullscreen";
+  $("fsTopBtn").textContent=on?"Exit Fullscreen":"Fullscreen";
+}
+async function toggleFullscreen(){
+  try{
+    if(document.fullscreenElement) await document.exitFullscreen();
+    else await wrapEl.requestFullscreen();
+  }catch(e){ log("fullscreen: "+e.message); }
+}
+$("fsBtn").onclick=toggleFullscreen; $("fsTopBtn").onclick=toggleFullscreen;
+document.addEventListener("fullscreenchange", ()=>{ updateFsLabel(); engine.resize(); });
+window.addEventListener("resize", ()=>engine.resize());
+$("respawnBtn").onclick=respawn;
+$("respawnBtn2").onclick=respawn;
+$("spectateBtn").onclick=()=>{ hideEndScreen(); spectating=true; $("spectateBar").classList.add("show"); };
+
+// ---------- Lock and fire ----------
+function forwardVec(){
+  return new V3(Math.sin(yaw)*Math.cos(pitch), Math.sin(pitch), Math.cos(yaw)*Math.cos(pitch));
+}
+function targetVelocity(p){
+  const f=new V3(Math.sin(p.yaw)*Math.cos(p.pitch), Math.sin(p.pitch), Math.cos(p.yaw)*Math.cos(p.pitch));
+  return f.scale(p.speed||0);
+}
+function isVisibleTarget(p){
+  if(!p || !p.alive) return false;
+  const dist=V3.Distance(jet.position, p.root.position);
+  if(dist>LOCK_RANGE_M) return false;
+  const toTarget=p.root.position.subtract(jet.position); toTarget.normalize();
+  const dot=V3.Dot(forwardVec(), toTarget);
+  if(dot<0.25) return false;
+  return true;
+}
+function tryLock(){
+  if(!joined){ showToast("JOIN FIRST - THEN PRESS L TO LOCK", 1800); return; }
+  if(!me.alive){ showToast("DESTROYED - RESPAWN TO FIGHT AGAIN", 1800); return; }
+  if(me.missiles_remaining<=0){ showNoMissiles(); return; }
+  let best=null, bestDist=Infinity;
+  for(const p of players.values()){
+    if(!isVisibleTarget(p)) continue;
+    const d=V3.Distance(jet.position, p.root.position);
+    if(d<bestDist){ bestDist=d; best=p; }
+  }
+  if(best){
+    me.lock_target=best.id;
+    showToast("LOCK - "+best.name+" - SPACE TO FIRE", 2200, "lock");
+    log("lock: "+best.name+" at "+Math.round(bestDist)+" m");
+    sendCharacterState(true);
+  } else {
+    me.lock_target="";
+    showToast("NO LOCK - NO TARGET VISIBLE WITHIN 200 M", 1800);
+    sendCharacterState(true);
+  }
+}
+function serializeLocalMissiles(){
+  return JSON.stringify(localMissiles.map((m)=>m.serialize()));
+}
+function tryFire(){
+  if(!joined) return;
+  if(!me.alive) return;
+  if(me.missiles_remaining<=0){ showNoMissiles(); return; }
+  if(!me.lock_target){
+    showToast("NO LOCK - PRESS L FIRST", 1800);
+    return;
+  }
+  const target=players.get(me.lock_target);
+  if(!target || !target.alive){
+    me.lock_target="";
+    showToast("LOCK LOST - PRESS L TO RE-LOCK", 1800);
+    sendCharacterState(true);
+    return;
+  }
+  const missile=localMissiles.find((m)=>m.isDocked());
+  if(!missile){ showNoMissiles(); return; }
+  const startPos=missile.getWorldPosition();
+  const startVel=forwardVec().scale(speed+30);
+  startPos.addInPlace(forwardVec().scale(SIDEWINDER_CONFIG.START_OFFSET_M));
+  missile.launch(me.lock_target, startPos, startVel);
+  me.missiles_remaining=Math.max(0, me.missiles_remaining-1);
+  showToast("SIDEWINDER AWAY - TRACKING "+target.name, 1800, "splash");
+  log("fired sidewinder slot "+missile.slot+" at "+target.name+" - remaining "+me.missiles_remaining);
+  sendCharacterState(true);
+}
+
+// ---------- Multiplayer ----------
+async function join(){
+  const name=$("name").value||"player";
+  const skill=Number($("skill").value||1000);
+  const disconnectSec=Number($("disconnectSec").value||60);
+  me.name=name; me.color=colorFor("me-"+name); me.score=0; me.health=100;
+  me.alive=true; me.missiles_remaining=4; me.lock_target=""; me.destroyed_by="";
+  for(const m of localMissiles) m.mount();
+  jet.setEnabled(true); hideEndScreen(); spectating=false; $("spectateBar").classList.remove("show");
+  const p=to3D(me.x, me.y); jet.position.set(p.x, 90, p.z);
+  const postJoin=(schema)=>api("/api/multiplayer/join",{method:"POST", body:JSON.stringify({
+    environment_name:ENV_NAME, character_name:name, game_id:GAME_ID,
+    player_id:"demo-"+name.toLowerCase().replace(/\W+/g,"-")+"-"+Math.random().toString(36).slice(2,6),
+    display_name:name, skill:{rating:skill},
+    config:{game_id:GAME_ID, requires_matchmaking:false, requires_turn_based:false, max_players_per_room:8, min_players_per_room:1, disconnectionTime:disconnectSec, disconnection_time_sec:disconnectSec, empty_game_ttl_sec:300, authority:{scopes:["items","environment","character_state"], resource_types:["*"], allow_client_claims:true}, character_schema:schema}
+  })});
+  let res=await postJoin(effectiveSchema);
+  let data=await res.json().catch(()=>({}));
+  if(res.status===409){
+    const stored=data.character_schema||data.characterSchema||(data.detail&& (data.detail.character_schema||data.detail.characterSchema));
+    if(stored){
+      effectiveSchema=stored;
+      res=await postJoin(effectiveSchema);
+      data=await res.json().catch(()=>({}));
+    }
+  }
+  if(!res.ok){ log("join failed: "+res.status+" "+JSON.stringify(data)); return; }
+  clientId=data.client_id||data.clientId||""; sessionId=data.session_id||data.sessionId||"";
+  roomId=data.room_id||data.roomId||"";
+  joined=true; lastPacketMs=performance.now();
+  for(const m of localMissiles) m.ownerId=clientId;
+  $("status").textContent="Joined as "+name+" - Room "+roomId+" - "+GAME_ID;
+  $("joinBtn").disabled=true; $("leaveBtn").disabled=false;
+  log("joined: "+clientId+" room "+roomId);
+  connectStream(); sendCharacterState(true);
+}
+async function leave(){
+  joined=false;
+  try{ await api("/api/multiplayer/leave",{method:"POST", body:"{}"}); }catch(e){}
+  if(stream) stream.close(); stream=null;
+  for(const id of [...players.keys()]) removeRemote(id);
+  $("status").textContent="Left."; $("joinBtn").disabled=false; $("leaveBtn").disabled=true;
+  hideEndScreen(); $("spectateBar").classList.remove("show");
+}
+async function sendHeartbeat(){
+  if(!clientId) return;
+  const res=await api("/api/multiplayer/heartbeat",{method:"POST", body:"{}"});
+  lastPacketMs=performance.now();
+  if(res.status===403){ log("heartbeat rejected - re-join."); await leave(); }
+}
+async function sendCharacterState(force){
+  if(!clientId) return;
+  const now=performance.now(); if(!force && now-lastSentMs<50) return;
+  lastSentMs=now; lastPacketMs=now;
+  const res=await api("/api/multiplayer/character-state",{method:"PATCH", body:JSON.stringify({
+    updates:[{ clientId, state:{
+      position:[me.x, me.y], health:me.health, name:me.name, color:me.color,
+      yaw:me.yaw, pitch:me.pitch, bank:me.bank, altitude:me.altitude, speed:me.speed,
+      anim:me.anim, velocity:[me.vx, me.vy],
+      alive:me.alive, missiles_remaining:me.missiles_remaining, lock_target:me.lock_target||"",
+      missiles:serializeLocalMissiles(), destroyed_by:me.destroyed_by||"" } }],
+    timestamp:Date.now(),
+  })});
+  if(res.status===403){ const d=await res.json().catch(()=>({})); log("character-state rejected: "+JSON.stringify(d)); await leave(); }
+}
+function handleStreamData(raw){
+  try{
+    let text=String(raw||"").trim(); if(text.startsWith("signals ")) text=text.slice("signals ".length);
+    const data=JSON.parse(text); const signals=data.signals||data;
+    const mp=signals.mp || (signals.match||signals.turnState||signals.characters||signals.items ? signals : null);
+    if(mp) applyMp(mp);
+  }catch(e){ log("stream parse: "+e); }
+}
+function connectStream(){
+  if(!sessionId) return;
+  if(stream) stream.close();
+  stream=new EventSource("/api/multiplayer/stream?session_id="+encodeURIComponent(sessionId));
+  stream.addEventListener("datastar-patch-signals",(ev)=>handleStreamData(ev.data));
+  stream.onmessage=(ev)=>handleStreamData(ev.data);
+  stream.onerror=()=>{ log("stream error - EventSource will retry"); };
+}
+function upsertRemote(id, data){
+  let p=players.get(id);
+  if(!p){
+    const built=buildJet(data.color||colorFor(id), id);
+    const root=built.jet;
+    p={id, x2d:WORLD_2D/2, y2d:WORLD_2D/2, health:100, score:0, name:data.name||"player", color:data.color||colorFor(id),
+       yaw:0, pitch:0, bank:0, altitude:90, speed:95, anim:"cruise", root, jet:built.jet, flame:built.flame, missiles:built.missiles,
+       alive:true, missiles_remaining:4, lock_target:"", destroyed_by:""};
+    players.set(id,p);
+  }
+  if(data.name) p.name=data.name;
+  if(typeof data.health==="number") p.health=data.health;
+  if(data.color) p.color=data.color;
+  if(typeof data.score==="number") p.score=data.score;
+  if(typeof data.yaw==="number") p.yaw=data.yaw;
+  if(typeof data.pitch==="number") p.pitch=data.pitch;
+  if(typeof data.bank==="number") p.bank=data.bank;
+  if(typeof data.altitude==="number") p.altitude=data.altitude;
+  if(typeof data.speed==="number") p.speed=data.speed;
+  if(data.anim) p.anim=data.anim;
+  if(typeof data.alive==="boolean") p.alive=data.alive;
+  if(typeof data.missiles_remaining==="number") p.missiles_remaining=data.missiles_remaining;
+  if(typeof data.lock_target==="string") p.lock_target=data.lock_target;
+  if(typeof data.destroyed_by==="string") p.destroyed_by=data.destroyed_by;
+  return p;
+}
+function removeRemote(id){
+  const p=players.get(id); if(!p) return;
+  try{ p.root.dispose(); }catch(e){}
+  if(id===me.lock_target) me.lock_target="";
+  players.delete(id);
+}
+function syncRemoteMissiles(p, missilesStr){
+  const entries=parseMissilesString(missilesStr);
+  if(!entries.length) return;
+  for(const entry of entries){
+    const m=p.missiles[entry.slot];
+    if(!m) continue;
+    if(entry.status==="docked"){
+      if(!m.isDocked() && p.alive) m.mount();
+      continue;
+    }
+    if(entry.status==="flying"){
+      if(m.isDocked()){
+        const startPos=new V3(entry.x, entry.y, entry.z);
+        const vel=targetVelocity(p).scale(0.5);
+        m.launch(entry.target||"", startPos, vel.length()>1?vel:new V3(0,0,60));
+      } else if(m.isFlying()){
+        const broadcast=new V3(entry.x, entry.y, entry.z);
+        m.node.position.copyFrom(V3.Lerp(m.node.position, broadcast, 0.4));
+        m.targetId=entry.target||m.targetId;
+      }
+      continue;
+    }
+    if(entry.status==="hit" || entry.status==="expired"){
+      if(m.isFlying()){
+        const key=p.id+":"+m.slot+":"+entry.status+":"+Math.round(entry.x)+","+Math.round(entry.y);
+        const pos=new V3(entry.x, entry.y, entry.z);
+        if(entry.status==="hit" && !explodedKeys.has(key)){
+          explodedKeys.add(key);
+          createExplosion(pos, 1.4);
+        }
+        if(entry.status==="hit") m.markHit(); else m.markExpired();
+        m.hide();
+      }
+    }
+  }
+}
+function applyMp(mp){
+  if(!mp) return;
+  if(mp.connection){
+    if(typeof mp.connection.isSynchronizer==="boolean") isSynchronizer=mp.connection.isSynchronizer;
+    if(mp.connection.roomId) roomId=mp.connection.roomId;
+  }
+  if(Array.isArray(mp.characters)){
+    for(const c of mp.characters){
+      if(!c||!c.clientId||c.clientId===clientId) continue;
+      const st=c.state||{};
+      const pos=normalizePos(st.position);
+      const wasAlive=players.has(c.clientId) ? players.get(c.clientId).alive : true;
+      const p=upsertRemote(c.clientId,{
+        name:st.name||"player", color:st.color||colorFor(c.clientId),
+        health:st.health??100, score:st.score??0,
+        yaw:typeof st.yaw==="number"?st.yaw:0,
+        pitch:typeof st.pitch==="number"?st.pitch:0,
+        bank:typeof st.bank==="number"?st.bank:0,
+        altitude:typeof st.altitude==="number"?st.altitude:90,
+        speed:typeof st.speed==="number"?st.speed:95,
+        anim:st.anim||"cruise",
+        alive:typeof st.alive==="boolean"?st.alive:true,
+        missiles_remaining:typeof st.missiles_remaining==="number"?st.missiles_remaining:4,
+        lock_target:typeof st.lock_target==="string"?st.lock_target:"",
+        destroyed_by:typeof st.destroyed_by==="string"?st.destroyed_by:""
+      });
+      p.x2d=pos.x2d; p.y2d=pos.y2d;
+      const t=to3D(pos.x2d, pos.y2d);
+      p.root.position.set(t.x, p.altitude, t.z);
+      p.root.rotation.set(-p.pitch, p.yaw, p.bank);
+      const boost=p.anim==="afterburner";
+      p.flame.scaling.set(0.6,0.6, boost?4:2.2);
+      p.flame.position.z=-3.7-p.flame.scaling.z*0.5;
+      if(wasAlive && !p.alive){
+        const epos=p.root.position.clone();
+        createExplosion(epos, 1.6);
+        p.root.setEnabled(false);
+        if(me.lock_target===p.id){
+          me.lock_target="";
+          showToast("TARGET DESTROYED - LOCK CLEARED", 1800, "splash");
+        }
+        log("destroyed: "+p.name+(p.destroyed_by ? " by "+p.destroyed_by : ""));
+      }
+      if(!wasAlive && p.alive){
+        p.root.setEnabled(true);
+        for(const m of p.missiles) m.mount();
+      }
+      p.root.setEnabled(p.alive);
+      if(typeof st.missiles==="string") syncRemoteMissiles(p, st.missiles);
+    }
+  }
+  if(mp.clientJoined) log("joined: "+mp.clientJoined.clientId);
+  if(mp.clientLeft){
+    const id=mp.clientLeft.clientId; if(id&&id!==clientId) removeRemote(id);
+    log("left: "+id);
+  }
+}
+$("joinBtn").onclick=join; $("leaveBtn").onclick=leave; $("resetBtn").onclick=reset;
+
+// ---------- Radar ----------
+const radarCanvas=$("radarCanvas");
+const rctx=radarCanvas.getContext("2d");
+function drawRadar(){
+  const S=360, C=S/2, R=C-8;
+  rctx.clearRect(0,0,S,S);
+  rctx.strokeStyle="rgba(120,220,255,.35)"; rctx.lineWidth=1;
+  for(const r of [R, R*0.66, R*0.33]){
+    rctx.beginPath(); rctx.arc(C,C,r,0,Math.PI*2); rctx.stroke();
+  }
+  rctx.beginPath(); rctx.moveTo(C,6); rctx.lineTo(C,S-6); rctx.moveTo(6,C); rctx.lineTo(S-6,C); rctx.stroke();
+  rctx.fillStyle="#9fd8ff"; rctx.font="bold 18px monospace"; rctx.textAlign="center"; rctx.fillText("N", C, 24);
+  const range=1200;
+  const drawDot=(dx,dz,color,isSelf,label,isMissile)=>{
+    const right=dx*Math.cos(yaw)-dz*Math.sin(yaw);
+    const fwd=dx*Math.sin(yaw)+dz*Math.cos(yaw);
+    let rx=right/range*R, ry=-fwd/range*R;
+    const len=Math.hypot(rx,ry);
+    if(len>R-6){ const s=(R-6)/len; rx*=s; ry*=s; }
+    const x=C+rx, y=C+ry;
+    if(isMissile){
+      rctx.beginPath(); rctx.moveTo(x,y-7); rctx.lineTo(x+5,y); rctx.lineTo(x,y+7); rctx.lineTo(x-5,y); rctx.closePath();
+      rctx.fillStyle="#ffaa00"; rctx.fill();
+      rctx.strokeStyle="#fff"; rctx.lineWidth=1; rctx.stroke();
+      if(label){ rctx.fillStyle="#ffcc66"; rctx.font="10px monospace"; rctx.textAlign="center"; rctx.fillText(label, x, y+16); }
+      return;
+    }
+    rctx.beginPath(); rctx.arc(x,y, isSelf?7:5,0,Math.PI*2);
+    rctx.fillStyle=color; rctx.fill();
+    rctx.strokeStyle="rgba(255,255,255,.85)"; rctx.lineWidth=1; rctx.stroke();
+    if(isSelf){
+      rctx.beginPath(); rctx.moveTo(x,y-9); rctx.lineTo(x-6,y+6); rctx.lineTo(x+6,y+6); rctx.closePath();
+      rctx.fillStyle="#fff"; rctx.fill();
+    }
+    if(label){ rctx.fillStyle="#e9f7ff"; rctx.font="11px monospace"; rctx.textAlign="center"; rctx.fillText(label, x, y+16); }
+  };
+  for(const p of players.values()){
+    if(!p.alive) continue;
+    const tMe=to3D(me.x, me.y), tP=to3D(p.x2d, p.y2d);
+    const isLocked=(me.lock_target===p.id);
+    drawDot(tP.x-tMe.x, tP.z-tMe.z, isLocked?"#ff4444":p.color, false, isLocked?("LOCK "+p.name):p.name);
+  }
+  for(const m of localMissiles){
+    if(!m.isFlying()) continue;
+    const wp=m.getWorldPosition();
+    drawDot(wp.x-jet.position.x, wp.z-jet.position.z, "#ffaa00", false, "MISSILE", true);
+  }
+  for(const p of players.values()){
+    for(const m of p.missiles){
+      if(!m.isFlying()) continue;
+      const wp=m.getWorldPosition();
+      drawDot(wp.x-jet.position.x, wp.z-jet.position.z, "#ffaa00", false, "MISSILE", true);
+    }
+  }
+  drawDot(0,0,"#fff",true,"YOU");
+  const lines=["You - white"];
+  for(const p of players.values()) lines.push((me.lock_target===p.id?"LOCK ":"")+p.name+" - "+p.color+"  "+Math.round(p.altitude)+"m"+(p.alive?"":" DESTROYED"));
+  lines.push("Missile - orange diamond");
+  $("radarLegend").textContent=lines.join("\n");
+}
+
+// ---------- Render loop ----------
+scene.onBeforeRenderObservable.add(()=>{
+  const dt=Math.min(engine.getDeltaTime()/1000,0.05); time+=dt;
+  if(performance.now()>toastUntil) $("toast").classList.remove("show");
+  const left=keys.has("KeyA")||keys.has("ArrowLeft");
+  const right=keys.has("KeyD")||keys.has("ArrowRight");
+  const up=keys.has("KeyW")||keys.has("ArrowUp");
+  const down=keys.has("KeyS")||keys.has("ArrowDown");
+  const boost=keys.has("ShiftLeft")||keys.has("ShiftRight");
+  if(me.alive && !spectating){
+    const turn=Number(right)-Number(left);
+    const climb=Number(up)-Number(down);
+    const smooth=1-Math.exp(-5*dt);
+    bank+=(-turn*0.75-bank)*smooth;
+    pitch+=(climb*0.48-pitch)*smooth;
+    yaw+=turn*0.6*dt;
+    speed+=((boost?175:95)-speed)*(1-Math.exp(-2*dt));
+    const forward=forwardVec();
+    jet.position.addInPlace(forward.scale(speed*dt));
+    jet.position.y=clamp(jet.position.y,12,650);
+    if(jet.position.x>1200) jet.position.x-=2400; if(jet.position.x<-1200) jet.position.x+=2400;
+    if(jet.position.z>1200) jet.position.z-=2400; if(jet.position.z<-1200) jet.position.z+=2400;
+    jet.rotation.set(-pitch, yaw, bank);
+    flame.scaling.z=(boost?4:2.2)+Math.sin(time*45)*0.2;
+    flame.position.z=-3.7-flame.scaling.z*0.5;
+    const behind=new V3(Math.sin(yaw)*27,-7,Math.cos(yaw)*27);
+    const desired=jet.position.subtract(behind);
+    camera.position.copyFrom(V3.Lerp(camera.position,desired,1-Math.exp(-4*dt)));
+    camera.setTarget(jet.position.add(forward.scale(18)).add(new V3(0,1,0)));
+  }
+  if(shakeMag>0){
+    camera.position.x+=(Math.random()-0.5)*shakeMag;
+    camera.position.y+=(Math.random()-0.5)*shakeMag;
+    shakeMag=Math.max(0, shakeMag-30*dt);
+  }
+  ocean.position.x=jet.position.x; ocean.position.z=jet.position.z;
+  waterTexture.uOffset=jet.position.x/12000*80; waterTexture.vOffset=jet.position.z/12000*80;
+  for(const cloud of clouds){
+    if(cloud.position.x-jet.position.x>1200) cloud.position.x-=2400;
+    if(cloud.position.x-jet.position.x<-1200) cloud.position.x+=2400;
+    if(cloud.position.z-jet.position.z>1200) cloud.position.z-=2400;
+    if(cloud.position.z-jet.position.z<-1200) cloud.position.z+=2400;
+  }
+  // Lock validation: break if target is gone, dead, too far, or behind us.
+  if(me.lock_target){
+    const target=players.get(me.lock_target);
+    if(!target || !target.alive){
+      me.lock_target="";
+      showToast("LOCK LOST", 1400);
+    } else {
+      const dist=V3.Distance(jet.position, target.root.position);
+      const toTarget=target.root.position.subtract(jet.position); toTarget.normalize();
+      const dot=V3.Dot(forwardVec(), toTarget);
+      if(dist>LOCK_BREAK_M || dot<0){
+        me.lock_target="";
+        showToast("LOCK LOST - TARGET OUT OF VIEW", 1600);
+        sendCharacterState(true);
+      }
+    }
+  }
+  // Lock reticle follows the locked jet.
+  if(me.lock_target){
+    const target=players.get(me.lock_target);
+    if(target && target.alive){
+      lockReticle.setEnabled(true);
+      lockReticle.position.copyFrom(target.root.position);
+      lockReticle.lookAt(camera.position);
+      const pulse=1+Math.sin(time*10)*0.12;
+      lockReticle.scaling.set(pulse,pulse,pulse);
+    } else {
+      lockReticle.setEnabled(false);
+    }
+  } else {
+    lockReticle.setEnabled(false);
+  }
+  // Under-lock warning: any living opponent locking onto me.
+  let lockedBy=null;
+  for(const p of players.values()){
+    if(p.alive && p.lock_target===clientId && clientId){ lockedBy=p; break; }
+  }
+  $("lockWarning").classList.toggle("active", !!lockedBy && me.alive && joined);
+  // Local missiles: steer, hit check, expire.
+  for(const m of localMissiles){
+    if(!m.isFlying()) continue;
+    const target=players.get(m.targetId);
+    let targetPos=null, targetVel=null;
+    if(target && target.alive){
+      targetPos=target.root.position.clone();
+      targetVel=targetVelocity(target);
+    } else if(m.lastTargetPos){
+      targetPos=m.lastTargetPos.clone();
+    }
+    m.update(dt, targetPos, targetVel);
+    if(target && target.alive && m.checkHit(targetPos)){
+      const hitPos=m.markHit();
+      const key=clientId+":"+m.slot+":hit";
+      if(!explodedKeys.has(key)){
+        explodedKeys.add(key);
+        createExplosion(hitPos, 1.5);
+      }
+      m.hide();
+      splashCount++;
+      showToast("SPLASH - "+target.name+" HIT", 2200, "splash");
+      log("splash: "+target.name);
+      sendCharacterState(true);
+    } else if(m.status==="expired"){
+      const pos=m.getWorldPosition();
+      createExplosion(pos, 0.5);
+      m.hide();
+      sendCharacterState(true);
+    }
+  }
+  // Remote missiles that hit me: I own my destruction, no one else sets it.
+  if(me.alive && joined){
+    for(const p of players.values()){
+      if(!p.alive) continue;
+      for(const m of p.missiles){
+        if(!m.isFlying()) continue;
+        if(m.targetId!==clientId) continue;
+        const wp=m.getWorldPosition();
+        if(V3.Distance(wp, jet.position)<SIDEWINDER_CONFIG.HIT_RADIUS){
+          const key=p.id+":"+m.slot+":hit-me";
+          if(!explodedKeys.has(key)){
+            explodedKeys.add(key);
+            createExplosion(wp.clone(), 1.5);
+          }
+          m.markHit(); m.hide();
+          destroyMe(p.id, p.name);
+          break;
+        }
+      }
+      if(!me.alive) break;
+    }
+  }
+  updateExplosions(dt);
+  // Sync me to server 2D.
+  const c2=to2D(jet.position.x, jet.position.z);
+  me.x=c2.x; me.y=c2.y; me.yaw=yaw; me.pitch=pitch; me.bank=bank; me.altitude=jet.position.y; me.speed=speed;
+  const fwd=forwardVec();
+  me.vx=fwd.x*speed; me.vy=fwd.z*speed;
+  me.anim=boost?"afterburner":"cruise";
+  // HUD + missile pips.
+  const lockedName=me.lock_target ? (players.get(me.lock_target)?.name||"") : "";
+  const pips="●".repeat(me.missiles_remaining)+"○".repeat(4-me.missiles_remaining);
+  $("missilePips").textContent=pips;
+  $("missilePips").className="pip"+(me.missiles_remaining===0?" empty":"");
+  $("missileText").textContent="SIDEWINDERS "+me.missiles_remaining+" / 4"+(lockedBy?" - UNDER LOCK BY "+lockedBy.name:"");
+  $("hud").textContent=
+    "VIPER FLIGHT\n"+
+    "W/S or Up/Down  Climb / descend\n"+
+    "A/D or Left/Right  Bank / turn\n"+
+    "Shift       Afterburner\n"+
+    "L           Radar lock (200 m, must be visible)\n"+
+    "SPACE       Fire Sidewinder at locked target\n"+
+    "R           Reset\n\n"+
+    "Speed    "+Math.round(speed*3.6)+" km/h\n"+
+    "Altitude "+Math.round(jet.position.y)+" m\n"+
+    "Engine   "+(boost?"AFTERBURNER":"CRUISE")+"\n"+
+    "Lock     "+(me.lock_target?("LOCKED - "+lockedName):"NONE - press L")+"\n"+
+    "Missiles "+me.missiles_remaining+" / 4 - no replenish in a life\n"+
+    "Splashes "+splashCount+"\n"+
+    (lockedBy ? "WARNING  LOCKED BY "+lockedBy.name+"\n" : "")+
+    (me.alive ? "" : "DESTROYED\n")+
+    "Players  "+(players.size+(joined?1:0))+" - "+GAME_ID+"\n"+
+    "Yaw      "+Math.round(yaw*180/Math.PI)+" deg  Pitch "+Math.round(pitch*180/Math.PI)+" deg";
+  drawRadar();
+  if(joined){
+    const animChanged=me.anim!==lastSentAnim;
+    if(animChanged){ lastSentAnim=me.anim; sendCharacterState(true); }
+    else if(performance.now()-lastPacketMs>10000) sendHeartbeat();
+    else sendCharacterState(false);
+  }
+});
+engine.runRenderLoop(()=>scene.render());
+</script>
+</body>
+</html>
