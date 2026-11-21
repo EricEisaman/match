@@ -104,6 +104,8 @@ Open:
 - http://localhost:8000/tic-tac-toe — turn-based demo
 - http://localhost:8000/top-down — realtime 2D demo
 - http://localhost:8000/babylon — realtime 3D third-person demo
+- http://localhost:8000/demo/bjs-jets — babylon.js realtime 3D jets demo
+- http://localhost:8000/demo/viper — babylon.js realtime 3D dogfight demo
 
 ### 2. Join a game (realtime, no matchmaking)
 
