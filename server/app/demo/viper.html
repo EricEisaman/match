@@ -342,7 +342,16 @@ function updateExplosions(dt){
 const keys=new Set();
 const controlled=new Set(["KeyW","KeyS","KeyA","KeyD","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","ShiftLeft","ShiftRight","KeyR","KeyL","Space"]);
 canvas.tabIndex=0;
+function isTypingTarget(e){
+  const el=e.target;
+  if(!el) return false;
+  const tag=(el.tagName||"").toLowerCase();
+  if(tag==="input" || tag==="textarea" || tag==="select") return true;
+  if(el.isContentEditable) return true;
+  return false;
+}
 function onDown(e){
+  if(isTypingTarget(e)) return;
   if(!controlled.has(e.code)) return;
   e.preventDefault();
   if(e.code==="KeyR" && !e.repeat) reset();
@@ -350,13 +359,19 @@ function onDown(e){
   if(e.code==="Space" && !e.repeat) tryFire();
   keys.add(e.code);
 }
-function onUp(e){ keys.delete(e.code); }
+function onUp(e){
+  if(isTypingTarget(e)){ keys.delete(e.code); return; }
+  keys.delete(e.code);
+}
 // Single window listener for all keys: canvas keydown bubbles to window,
 // so a second canvas listener would fire L / SPACE twice and double-fire.
 window.addEventListener("keydown", onDown);
 window.addEventListener("keyup", onUp);
 window.addEventListener("blur", ()=>keys.clear());
 canvas.addEventListener("pointerdown", ()=>canvas.focus());
+for(const el of document.querySelectorAll("input, textarea, select")){
+  el.addEventListener("focus", ()=>keys.clear());
+}
 
 let yaw=0, pitch=0, bank=0, speed=95, time=0;
 function reset(){
