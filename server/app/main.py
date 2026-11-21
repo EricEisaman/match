@@ -1930,8 +1930,7 @@ def _serve_demo_file(name: str):
         ".js": "application/javascript; charset=utf-8",
         ".css": "text/css; charset=utf-8",
         ".json": "application/json; charset=utf-8",
-        ".glb": "model/gltf-binary",
-        ".ico": "image/x-icon",
+        ".glb": "model/gltf-binary"
     }
     if ext not in media_types:
         raise HTTPException(400, "Invalid demo file type")
@@ -1947,9 +1946,13 @@ def _serve_demo_file(name: str):
         return Response(demo_file.read_bytes(), media_type=media_types[ext])
     return Response(demo_file.read_text(encoding="utf-8"), media_type=media_types[ext])
 
+@app.get("/demo/favicon.ico", include_in_schema=False)
+def demo_favicon():
+    return _serve_demo_binary_file("favicon.ico")
+
 @app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    return _serve_demo_file("favicon.ico")
+def root_favicon():
+    return _serve_demo_binary_file("favicon.ico")
 
 @app.get("/tic-tac-toe", include_in_schema=False)
 async def tic_tac_toe_demo_page():
@@ -2039,6 +2042,7 @@ _BABYLON_DEMO_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".css": "text/css; charset=utf-8",
+    ".ico": "image/x-icon",
 }
 
 
