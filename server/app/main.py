@@ -1914,14 +1914,37 @@ app.include_router(bgs_router)
 
 def _serve_demo_file(name: str):
     """Shared helper for /tic-tac-toe and /demo/{name}."""
-    from fastapi.responses import HTMLResponse
-    safe = "".join(c for c in name if c.isalnum() or c in ("-", "_"))
-    if not safe or safe != name:
+    from fastapi.responses import Response
+    if not name or "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "Invalid demo name")
-    demo_file = _path.Path(__file__).parent / "demo" / f"{safe}.html"
+    if "." in name:
+        stem, _, ext = name.rpartition(".")
+        ext = "." + ext.lower()
+    else:
+        stem, ext = name, ".html"
+    safe = "".join(c for c in stem if c.isalnum() or c in ("-", "_"))
+    if not safe or safe != stem:
+        raise HTTPException(400, "Invalid demo name")
+    media_types = {
+        ".html": "text/html; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".glb": "model/gltf-binary",
+    }
+    if ext not in media_types:
+        raise HTTPException(400, "Invalid demo file type")
+    demo_dir = _path.Path(__file__).parent / "demo"
+    demo_file = demo_dir / f"{safe}{ext}"
+    try:
+        demo_file.resolve().relative_to(demo_dir.resolve())
+    except ValueError:
+        raise HTTPException(400, "Invalid demo name")
     if not demo_file.exists():
-        raise HTTPException(404, f"No demo client named '{safe}'")
-    return HTMLResponse(demo_file.read_text(encoding="utf-8"))
+        raise HTTPException(404, f"No demo client named '{safe}{ext}'")
+    if ext == ".glb":
+        return Response(demo_file.read_bytes(), media_type=media_types[ext])
+    return Response(demo_file.read_text(encoding="utf-8"), media_type=media_types[ext])
 
 
 @app.get("/tic-tac-toe", include_in_schema=False)
