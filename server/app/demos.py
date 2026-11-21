@@ -63,7 +63,7 @@ DEMOS = {
         "max_players": 8,
         "character": "viper-jet",
         "notes": (
-            "Viper: bjs-jets + Sidewinders. L = radar lock (visible + within 1000 m), "
+            "Viper: bjs-jets + Sidewinders. L = radar lock (visible + within 1000 m, breaks at 1200 m), "
             "SPACE = fire at locked target. Each jet carries 4 Sidewinders, 2 under each wing, "
             "no replenish in a life (respawn rearms). Missiles, lock_target, alive, "
             "missiles_remaining, destroyed_by ride in character-state, so every client "

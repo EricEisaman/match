@@ -621,14 +621,38 @@ function syncRemoteMissiles(p, missilesStr){
       continue;
     }
     if(entry.status==="hit" || entry.status==="expired"){
+      const pos=new V3(entry.x, entry.y, entry.z);
+      // FIX: a hit aimed at me is authoritative, even if my copy of this
+      // missile was still docked. The flying update and the hit update can
+      // arrive in the same tick, and at 230 m/s + 20 Hz sync the missile
+      // jumps 11 m+ per update, so proximity alone can tunnel past.
+      if(entry.status==="hit" && entry.target===clientId && me.alive && joined){
+        const key=p.id+":"+m.slot+":hit-me";
+        if(!explodedKeys.has(key)){
+          explodedKeys.add(key);
+          createExplosion(pos.clone(), 1.5);
+        }
+        if(m.isFlying()) m.markHit(); else { m.status="hit"; if(m.exhaust) m.exhaust.setEnabled(false); }
+        m.hide();
+        destroyMe(p.id, p.name);
+        continue;
+      }
       if(m.isFlying()){
         const key=p.id+":"+m.slot+":"+entry.status+":"+Math.round(entry.x)+","+Math.round(entry.y);
-        const pos=new V3(entry.x, entry.y, entry.z);
         if(entry.status==="hit" && !explodedKeys.has(key)){
           explodedKeys.add(key);
           createExplosion(pos, 1.4);
         }
         if(entry.status==="hit") m.markHit(); else m.markExpired();
+        m.hide();
+      } else if(entry.status==="hit"){
+        // Hit on someone else: still show the explosion even if we never saw it flying.
+        const key=p.id+":"+m.slot+":hit:"+Math.round(entry.x)+","+Math.round(entry.y);
+        if(!explodedKeys.has(key)){
+          explodedKeys.add(key);
+          createExplosion(pos, 1.4);
+        }
+        m.status="hit";
         m.hide();
       }
     }
@@ -874,7 +898,8 @@ scene.onBeforeRenderObservable.add(()=>{
         if(!m.isFlying()) continue;
         if(m.targetId!==clientId) continue;
         const wp=m.getWorldPosition();
-        if(V3.Distance(wp, jet.position)<SIDEWINDER_CONFIG.HIT_RADIUS){
+        // Remote check is wider than local: 20 Hz sync + 230 m/s = 11 m+ jump per update.
+        if(V3.Distance(wp, jet.position)<SIDEWINDER_CONFIG.HIT_RADIUS*2.5){
           const key=p.id+":"+m.slot+":hit-me";
           if(!explodedKeys.has(key)){
             explodedKeys.add(key);
@@ -906,7 +931,7 @@ scene.onBeforeRenderObservable.add(()=>{
     "W/S or Up/Down  Climb / descend\n"+
     "A/D or Left/Right  Bank / turn\n"+
     "Shift       Afterburner\n"+
-    "L           Radar lock (200 m, must be visible)\n"+
+    "L           Radar lock (1000 m, must be visible)\n"+
     "SPACE       Fire Sidewinder at locked target\n"+
     "R           Reset\n\n"+
     "Speed    "+Math.round(speed*3.6)+" km/h\n"+
